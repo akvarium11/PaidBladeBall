@@ -106,6 +106,7 @@ local Config = {
     DebugConsole = true, -- Logs target threat & parry triggers to F9 developer console
     RangeRing = true,    -- Draws 3D floor ring for parry distance
     Trajectory = true,   -- Draws ball flight trajectory line
+    KeybindHUD = true,   -- Floating Keybinds Island HUD
     UseRemote = false,   -- Disabled by default to avoid Matcha "hybrid mode" errors
 }
 
@@ -641,6 +642,7 @@ task.spawn(function()
     end
 
     local dotObj = {}
+    local hudBg, hudLine, hudHeader, hudItem
 
     while true do
         task.wait(0.016) -- ~60 FPS update rate for 3D Ring
@@ -714,6 +716,54 @@ task.spawn(function()
                     end
                 end
             end
+            -- Render Keybind HUD Island (Fallback when Lib is not loaded)
+            if Config.KeybindHUD and not Lib then
+                if not hudBg then
+                    hudBg = Drawing.new("Square")
+                    hudBg.Filled = true
+                    hudBg.Color = Color3.fromRGB(18, 18, 22)
+                    hudBg.Transparency = 0.85
+                    hudBg.Size = Vector2.new(175, 48)
+                    hudBg.Position = Vector2.new(20, 100)
+
+                    hudLine = Drawing.new("Line")
+                    hudLine.From = Vector2.new(20, 100)
+                    hudLine.To = Vector2.new(195, 100)
+                    hudLine.Color = Color3.fromRGB(122, 134, 255)
+                    hudLine.Thickness = 2
+
+                    hudHeader = Drawing.new("Text")
+                    hudHeader.Text = "KEYBINDS"
+                    hudHeader.Size = 12
+                    hudHeader.Color = Color3.fromRGB(160, 160, 185)
+                    hudHeader.Position = Vector2.new(28, 105)
+
+                    hudItem = Drawing.new("Text")
+                    hudItem.Size = 14
+                    hudItem.Position = Vector2.new(28, 124)
+                end
+
+                hudBg.Visible = true
+                hudLine.Visible = true
+                hudHeader.Visible = true
+                hudItem.Visible = true
+
+                local keyName = Config.AutoParryKey or "X"
+                if Config.AutoParry then
+                    hudItem.Text = string.format("Auto Parry  [%s]  ON", keyName)
+                    hudItem.Color = Color3.fromRGB(0, 255, 150)
+                else
+                    hudItem.Text = string.format("Auto Parry  [%s]  OFF", keyName)
+                    hudItem.Color = Color3.fromRGB(200, 70, 70)
+                end
+            else
+                if hudBg then
+                    hudBg.Visible = false
+                    hudLine.Visible = false
+                    hudHeader.Visible = false
+                    hudItem.Visible = false
+                end
+            end
         end)
     end
 end)
@@ -732,7 +782,7 @@ if Lib and Lib.CreateWindow then
         accentA = Color3.fromRGB(122, 134, 255),
         accentB = Color3.fromRGB(189, 130, 255),
         startOpen = true,
-        keybindOverlay = false,
+        keybindOverlay = Config.KeybindHUD,
         checkboxStyle = true,
         smartFps = true,
         autoSave = true,
@@ -796,6 +846,13 @@ if Lib and Lib.CreateWindow then
 
     RenderSection:Toggle("Ball Flight Trajectory", Config.Trajectory, function(v)
         Config.Trajectory = v
+    end)
+
+    RenderSection:Toggle("Keybinds Island (HUD)", Config.KeybindHUD, function(v)
+        Config.KeybindHUD = v
+        if Window and type(Window.SetKeybindOverlay) == "function" then
+            Window:SetKeybindOverlay(v)
+        end
     end)
 
     DebugSection:Toggle("Console Logs (F9 Output)", Config.DebugConsole, function(v)
