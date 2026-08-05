@@ -18,12 +18,13 @@ local lp = Players.LocalPlayer
 --------------------------------------------------------------------------------
 local Config = {
     AutoParry = false,
-    ParryMode = "F Key", -- "F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse + Remote)"
+    ParryMode = "F Key", -- "F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse)"
     MinAuraRadius = 18,  -- Minimum aura circle radius (studs)
     AutoAbility = false,
     DebugConsole = true, -- Logs target threat & parry triggers to F9 developer console
     RangeRing = true,    -- Draws 3D floor ring for parry distance
     Trajectory = true,   -- Draws ball flight trajectory line
+    UseRemote = false,   -- Disabled by default to avoid Matcha "hybrid mode" errors
 }
 
 local State = {
@@ -33,6 +34,8 @@ local State = {
     lastThreatState = nil,
     lastAbilityTime = 0,
     ping = 60,
+    prevRawPos = Vector3.new(),
+    rawVel = Vector3.new(),
 }
 
 --------------------------------------------------------------------------------
@@ -77,8 +80,10 @@ local function CustomW2S(pos)
 end
 
 --------------------------------------------------------------------------------
--- Anti-Cheat Ball Resolver (Low-Latency Responsive Trajectory Tracker)
+-- Anti-Cheat Ball Resolver (Physical Speed Cap & Outlier Filter)
 --------------------------------------------------------------------------------
+local MAX_PHYSICAL_SPEED = 550 -- Max realistic ball speed (studs/s). Anything above is anti-cheat teleport jump.
+
 local Resolver = {
     rawPos = Vector3.new(),
     resolvedPos = Vector3.new(),
@@ -87,7 +92,6 @@ local Resolver = {
     lastValidTime = 0,
     outlierCount = 0,
     validCount = 0,
-    samples = {},
 }
 
 function Resolver:Reset()
@@ -98,7 +102,8 @@ function Resolver:Reset()
     self.lastValidTime = 0
     self.outlierCount = 0
     self.validCount = 0
-    self.samples = {}
+    State.prevRawPos = Vector3.new()
+    State.rawVel = Vector3.new()
 end
 
 function Resolver:Update(part, dt)
@@ -111,62 +116,58 @@ function Resolver:Update(part, dt)
     self.rawPos = raw
     local now = tick()
 
+    dt = math.clamp(dt, 0.001, 0.1)
+
+    -- Calculate instantaneous raw frame velocity
+    local instantSpeed = 0
+    if State.prevRawPos ~= Vector3.new() then
+        local delta = raw - State.prevRawPos
+        instantSpeed = delta.Magnitude / dt
+        if instantSpeed <= MAX_PHYSICAL_SPEED then
+            State.rawVel = delta / dt
+        end
+    end
+    State.prevRawPos = raw
+
     if self.validCount == 0 or self.resolvedPos == Vector3.new() then
-        self.resolvedPos = raw
-        self.resolvedVel = Vector3.new()
-        self.spd = 0
-        self.lastValidTime = now
-        self.validCount = 1
+        if instantSpeed <= MAX_PHYSICAL_SPEED then
+            self.resolvedPos = raw
+            self.resolvedVel = State.rawVel
+            self.spd = State.rawVel.Magnitude
+            self.lastValidTime = now
+            self.validCount = 1
+        end
         return true
     end
 
-    dt = math.clamp(dt, 0.001, 0.1)
-
-    -- Expected position based on current resolved velocity vector
-    local predictedPos = self.resolvedPos + self.resolvedVel * dt
-    local posErr = (raw - predictedPos).Magnitude
-    local rawSpeed = (raw - self.resolvedPos).Magnitude / dt
-
-    -- Filter Criteria:
-    -- 1. Error from predicted physical trajectory is reasonable (< 45 studs)
-    -- OR 2. Raw movement speed between ticks is within realistic speed (< 450 studs/s)
-    local isValid = (posErr < 45) or (rawSpeed < 450)
-
-    if not isValid then
+    -- Reject Anti-Cheat Teleport Jumps (Extreme Speeds > 550 studs/s)
+    if instantSpeed > MAX_PHYSICAL_SPEED then
         self.outlierCount = self.outlierCount + 1
-        table.insert(self.samples, raw)
-        if #self.samples > 4 then table.remove(self.samples, 1) end
-
-        -- If raw positions consistently cluster over multiple updates, re-anchor trajectory immediately
-        if #self.samples >= 2 then
-            local p1 = self.samples[#self.samples]
-            local p2 = self.samples[#self.samples - 1]
-            local clusterSpeed = (p1 - p2).Magnitude / dt
-            if clusterSpeed < 450 then
-                isValid = true
-                self.resolvedPos = p1
-                self.resolvedVel = (p1 - p2) / dt
-                self.samples = {}
-            end
-        end
-    else
-        self.samples = {}
-    end
-
-    if isValid then
-        -- Accept sample with fast 0.70 LERP for minimal tracking lag
-        local calcVel = (raw - self.resolvedPos) / dt
-        self.resolvedPos = self.resolvedPos:Lerp(raw, 0.70)
-        self.resolvedVel = self.resolvedVel:Lerp(calcVel, 0.65)
-        self.spd = self.resolvedVel.Magnitude
-        self.lastValidTime = now
-        self.validCount = self.validCount + 1
-    else
-        -- Reject fake teleport jump from anti-cheat
-        -- Advance predicted position along current trajectory
+        -- Advance predicted position along last valid physical trajectory
         self.resolvedPos = self.resolvedPos + self.resolvedVel * dt
         self.spd = self.resolvedVel.Magnitude
+        return false
     end
+
+    -- Real physical ball movement! Check instant turnaround (deflection/return hit)
+    if State.rawVel.Magnitude > 10 and self.resolvedVel.Magnitude > 10 then
+        local dirDot = State.rawVel.Unit:Dot(self.resolvedVel.Unit)
+        if dirDot < 0.4 then
+            -- Sudden turnaround hit! Snap immediately!
+            self.resolvedPos = raw
+            self.resolvedVel = State.rawVel
+            self.spd = State.rawVel.Magnitude
+            self.lastValidTime = now
+            return true
+        end
+    end
+
+    -- Normal physical movement: update position & velocity with fast lerp
+    self.resolvedPos = self.resolvedPos:Lerp(raw, 0.75)
+    self.resolvedVel = self.resolvedVel:Lerp(State.rawVel, 0.70)
+    self.spd = self.resolvedVel.Magnitude
+    self.lastValidTime = now
+    self.validCount = self.validCount + 1
 
     return true
 end
@@ -188,7 +189,7 @@ local function getBallPart()
 end
 
 --------------------------------------------------------------------------------
--- Strict Directional Threat Scanning (Prevents false triggers when standing near)
+-- Direction Scanning (Sanitized Physics Bounds Only)
 --------------------------------------------------------------------------------
 local function scanBallDirection()
     local chr = getLocalCharacter()
@@ -202,8 +203,8 @@ local function scanBallDirection()
 
     local distToPlayer = (hrp.Position - ballPos).Magnitude
 
-    -- Require ball to be moving at physical flying speed (> 6 studs/s)
-    if ballSpeed < 6 then
+    -- Require ball speed to be within valid physical range (5 - 550 studs/s)
+    if ballSpeed < 6 or ballSpeed > MAX_PHYSICAL_SPEED then
         return false, 0, distToPlayer, 999, 999
     end
 
@@ -214,12 +215,11 @@ local function scanBallDirection()
     local perpDist = distToPlayer * math.sqrt(math.max(0, 1 - dotProd^2))
     local tti = distToPlayer / math.max(ballSpeed, 0.1)
 
-    -- STRICT Directional Threat Criteria:
-    -- 1. Velocity vector MUST point directly at local player (dotProd > 0.88)
-    -- 2. Perpendicular trajectory miss distance MUST be tight (< 6.5 studs)
-    -- (This prevents false triggers when player is standing near the ball or when ball flies past)
+    -- Strict Directional Threat Criteria:
+    -- 1. Velocity vector points directly at local player (dotProd > 0.88)
+    -- 2. Perpendicular trajectory miss distance is within hit area (< 10.0 studs)
     local isThreat = false
-    if dotProd > 0.88 and perpDist < 6.5 then
+    if dotProd > 0.88 and perpDist < 10.0 then
         isThreat = true
     end
 
@@ -227,7 +227,7 @@ local function scanBallDirection()
 end
 
 --------------------------------------------------------------------------------
--- Parry & Ability Action Execution (F Key, Mouse, Remote)
+-- Physical Parry & Ability Action Execution (F Key, Mouse)
 --------------------------------------------------------------------------------
 local function pressFKey()
     pcall(function() setrobloxinput(true) end)
@@ -284,18 +284,13 @@ local function pressLMB()
 end
 
 local function fireParryRemote()
+    if not Config.UseRemote then return end
     pcall(function()
         local remotes = ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage:FindFirstChild("remotes")
         if remotes then
             local pb = remotes:FindFirstChild("ParryButtonPress") or remotes:FindFirstChild("ParryAttempt") or remotes:FindFirstChild("Parry")
             if pb and pb:IsA("RemoteEvent") then
                 pcall(function() pb:FireServer() end)
-                return
-            end
-        end
-        for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-            if obj:IsA("RemoteEvent") and (obj.Name:find("Parry") or obj.Name:find("parry")) then
-                pcall(function() obj:FireServer() end)
                 return
             end
         end
@@ -314,7 +309,7 @@ local function doParry()
         pressFKey()
         pressLMB()
         fireParryRemote()
-    else -- "All (Key + Mouse + Remote)"
+    else -- "All (Key + Mouse)"
         pressFKey()
         pressLMB()
         fireParryRemote()
@@ -335,7 +330,7 @@ local function doAbility()
 end
 
 --------------------------------------------------------------------------------
--- Main Loop (Heartbeat Thread with Latency Lead Compensation)
+-- Main Loop (Physical Speed Filtered Heartbeat)
 --------------------------------------------------------------------------------
 local lastTime = tick()
 
@@ -360,16 +355,14 @@ RunService.Heartbeat:Connect(function()
 
     local isThreat, dotProd, distToPlayer, tti, perpDist = scanBallDirection()
 
-    -- Dynamic Aura Radius with Ping & Velocity Lead Time Compensation:
-    -- Higher speed & higher ping -> expand trigger radius significantly early!
+    -- Dynamic Aura Radius based strictly on REAL physical ball speed (capped at 550 studs/s)
     local baseAuraRadius = Config.MinAuraRadius or 18
-    local pingLeadFactor = (State.ping / 1000) + 0.35 -- seconds of lead time
+    local pingLeadFactor = (State.ping / 1000) + 0.25 -- seconds of lead time
     local speedAddition = Resolver.spd * pingLeadFactor
-    State.auraRadius = math.clamp(baseAuraRadius + speedAddition, baseAuraRadius, 150)
+    State.auraRadius = math.clamp(baseAuraRadius + speedAddition, baseAuraRadius, 75)
 
     -- Dynamic TTI Threshold for Early Parry
-    -- Trigger parry when TTI is less than network ping + reaction window (e.g. ~0.22s - 0.40s)
-    local targetTTIThreshold = math.clamp((State.ping / 1000) + 0.22, 0.15, 0.45)
+    local targetTTIThreshold = math.clamp((State.ping / 1000) + 0.20, 0.15, 0.40)
 
     -- Console Logger for Target Threat Status
     if Config.DebugConsole then
@@ -383,20 +376,20 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- Check Parry Condition:
-    -- 1. Threat is confirmed via strict direction scan (dot > 0.88, perpDist < 6.5)
-    -- 2. AND (Distance is inside auraRadius OR TTI <= targetTTIThreshold)
-    -- 3. AND Cooldown > 0.25s since last parry
+    -- Parry Trigger Condition:
+    -- 1. Threat is confirmed (Dot > 0.88, PerpDist < 10.0, Speed <= 550)
+    -- 2. AND (distToPlayer <= auraRadius OR TTI <= targetTTIThreshold)
+    -- 3. AND Cooldown > 0.15s
     local timeSinceLastParry = now - State.lastParryTime
-    local insideAura = (distToPlayer <= State.auraRadius) or (tti <= targetTTIThreshold)
-    local shouldParry = Config.AutoParry and isThreat and insideAura and timeSinceLastParry > 0.25
+    local distanceTrigger = (distToPlayer <= State.auraRadius) or (tti <= targetTTIThreshold)
+    local shouldParry = Config.AutoParry and isThreat and distanceTrigger and timeSinceLastParry > 0.15
 
     if shouldParry then
         State.lastParryTime = now
         State.parryCount = State.parryCount + 1
 
         if Config.DebugConsole then
-            print(string.format("[AutoParry] ⚡ PARRY EXECUTED (#%d)! Mode: %s | Dist: %.1f <= Aura: %.1f studs | Speed: %.1f studs/s | TTI: %.2fs (Thresh: %.2fs)", State.parryCount, Config.ParryMode, distToPlayer, State.auraRadius, Resolver.spd, tti, targetTTIThreshold))
+            print(string.format("[AutoParry] ⚡ PARRY EXECUTED (#%d)! Mode: %s | Dist: %.1f <= Aura: %.1f studs | Speed: %.1f studs/s | TTI: %.2fs", State.parryCount, Config.ParryMode, distToPlayer, State.auraRadius, Resolver.spd, tti))
         end
 
         doParry()
@@ -477,7 +470,7 @@ task.spawn(function()
 
             -- Render Resolved Trajectory Line
             for _, l in pairs(dotObj) do if l then l.Visible = false end end
-            if Config.Trajectory and Resolver.spd > 1 and Resolver.resolvedPos ~= Vector3.new() then
+            if Config.Trajectory and Resolver.spd > 1 and Resolver.spd <= MAX_PHYSICAL_SPEED and Resolver.resolvedPos ~= Vector3.new() then
                 local prev
                 local velDir = Resolver.resolvedVel.Unit
                 for i = 0, 5 do
@@ -538,7 +531,7 @@ if Lib and Lib.CreateWindow then
         end
     end)
 
-    ParrySection:Dropdown("Parry Input Mode", {"F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse + Remote)"}, Config.ParryMode, function(v)
+    ParrySection:Dropdown("Parry Input Mode", {"F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse)"}, Config.ParryMode, function(v)
         Config.ParryMode = v
     end)
 
@@ -571,4 +564,4 @@ if Lib and Lib.CreateWindow then
     end)
 end
 
-print("=== Blade Ball Auto Parry (Optimized Latency & Strict Direction) Loaded ===")
+print("=== Blade Ball Auto Parry (AntiCheat Teleport Filter + Physical Speed Cap) Loaded ===")
