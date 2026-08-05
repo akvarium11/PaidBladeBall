@@ -65,6 +65,7 @@ local State = {
     parriedBall = nil,
     parryTime = 0,
     targetTTI = 0.18,  -- initial 180ms timing, auto-adjusts dynamically
+    auraRadius = 10,   -- dynamic white aura circle radius
     parriedAt = 0,
     checkBall = nil,
     checkTime = 0,
@@ -104,6 +105,49 @@ local function norm(v)
 end
 local function dist(a, b) return a and b and mag(a - b) or 9999 end
 local function sub(a, b) return a and b and (a - b) or Vector3.new() end
+
+local function CustomW2S(pos)
+    if not pos then return Vector2.new(0, 0), false end
+    local res1, res2 = nil, nil
+    if type(WorldToScreen) == "function" then
+        local ok, r1, r2 = pcall(WorldToScreen, pos)
+        if ok and r1 then res1, res2 = r1, r2 end
+    elseif type(w2s) == "function" then
+        local ok, r1, r2 = pcall(w2s, pos)
+        if ok and r1 then res1, res2 = r1, r2 end
+    end
+    if not res1 then
+        local camera = game.Workspace.CurrentCamera
+        if camera then
+            local ok, sp, inViewport = pcall(function() return camera:WorldToViewportPoint(pos) end)
+            if ok and sp then
+                res1 = sp
+                res2 = inViewport
+            end
+        end
+    end
+    if not res1 then return Vector2.new(0, 0), false end
+    local screenVec = Vector2.new(0, 0)
+    local onScreen = false
+    if typeof(res1) == "Vector3" then
+        screenVec = Vector2.new(res1.X, res1.Y)
+        if type(res2) == "boolean" then
+            onScreen = res2 and (res1.Z > 0)
+        else
+            onScreen = (res1.Z > 0)
+        end
+    elseif typeof(res1) == "Vector2" then
+        screenVec = res1
+        if type(res2) == "boolean" then
+            onScreen = res2
+        elseif type(res2) == "number" then
+            onScreen = res2 > 0
+        else
+            onScreen = true
+        end
+    end
+    return screenVec, onScreen
+end
 
 local function attr(c, k)
     if not c then return nil end
@@ -472,50 +516,115 @@ local function formatAttributes(inst)
 end
 
 --------------------------------------------------------------------------------
--- Parry & Ability Action Execution (F Key)
+-- Parry & Ability Action Execution (F Key, LMB, Remote)
 --------------------------------------------------------------------------------
-local function pressFKey()
-    local handled = false
 
-    -- Method 1: Matcha / Executor native keypress(0x46)
-    if type(keypress) == "function" then
-        local ok = pcall(function()
-            keypress(0x46)
-            if type(keyrelease) == "function" then
-                task.wait()
-                keyrelease(0x46)
+-- Direct Server Remote Parry Trigger
+local function fireParryRemote()
+    local success = false
+    pcall(function()
+        local remotes = ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage:FindFirstChild("remotes")
+        if remotes then
+            local pb = remotes:FindFirstChild("ParryButtonPress") or remotes:FindFirstChild("ParryAttempt") or remotes:FindFirstChild("Parry")
+            if pb and pb:IsA("RemoteEvent") then
+                pb:FireServer()
+                success = true
+                return
             end
-            handled = true
-        end)
-        if ok and handled then return end
-    end
+        end
+        for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+            if obj:IsA("RemoteEvent") and (obj.Name:find("Parry") or obj.Name:find("parry")) then
+                obj:FireServer()
+                success = true
+                return
+            end
+        end
+    end)
+    return success
+end
 
-    -- Method 2: VirtualInputManager SendKeyEvent F (0x46)
+-- Physical Key F press (Non-blocking with setrobloxinput focus)
+local function pressFKey()
+    pcall(function() setrobloxinput(true) end)
+
+    -- Method 1: VirtualInputManager Key F
     if VirtualInputManager then
         pcall(function()
             VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
-            task.wait()
-            VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
-            handled = true
+            task.spawn(function()
+                task.wait(0.03)
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+            end)
         end)
-        if handled then return end
     end
 
-    -- Method 3: Mouse fallback if configured
-    if Config.ParryMode == "Mouse" then
-        if type(mouse1click) == "function" then
-            mouse1click()
-        elseif type(mouse1press) == "function" then
-            mouse1press()
-            task.wait()
-            if type(mouse1release) == "function" then mouse1release() end
-        end
+    -- Method 2: Executor native keyclick / keypress (0x46 = 'F')
+    if type(keyclick) == "function" then
+        pcall(function() keyclick(0x46) end)
+    elseif type(keypress) == "function" then
+        pcall(function()
+            keypress(0x46)
+            task.spawn(function()
+                task.wait(0.03)
+                if type(keyrelease) == "function" then keyrelease(0x46) end
+            end)
+        end)
     end
 end
 
+-- Physical LMB (Left Mouse Button) press (Non-blocking with setrobloxinput focus)
+local function pressLMB()
+    pcall(function() setrobloxinput(true) end)
+
+    -- Method 1: VirtualInputManager MouseButton1
+    if VirtualInputManager then
+        pcall(function()
+            local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(500, 500)
+            local vx, vy = vp.X / 2, vp.Y / 2
+            VirtualInputManager:SendMouseButtonEvent(vx, vy, 0, true, game, 1)
+            task.spawn(function()
+                task.wait(0.03)
+                VirtualInputManager:SendMouseButtonEvent(vx, vy, 0, false, game, 1)
+            end)
+        end)
+    end
+
+    -- Method 2: Executor native mouse functions
+    if type(mouse1click) == "function" then
+        pcall(mouse1click)
+    elseif type(mouse1press) == "function" then
+        pcall(function()
+            mouse1press()
+            task.spawn(function()
+                task.wait(0.03)
+                if type(mouse1release) == "function" then mouse1release() end
+            end)
+        end)
+    end
+    if type(click) == "function" then pcall(click) end
+end
+
 local function doParry()
-    logStage(4, "EXECUTION", string.format("Action: Key F Pressed | Mode: %s | Ball Speed: %.1f", Config.ParryMode, State.spd))
-    pressFKey()
+    logStage(4, "EXECUTION", string.format("Action: Parry Triggered | Mode: %s | Ball Speed: %.1f", Config.ParryMode, State.spd))
+
+    pcall(function() setrobloxinput(true) end)
+
+    local mode = Config.ParryMode
+    if mode == "F Key" then
+        pressFKey()
+        fireParryRemote()
+    elseif mode == "LMB (Mouse)" or mode == "Mouse" then
+        pressLMB()
+        fireParryRemote()
+    elseif mode == "Both (F + LMB)" then
+        pressFKey()
+        pressLMB()
+        fireParryRemote()
+    else -- "All (Key + Mouse + Remote)"
+        pressFKey()
+        pressLMB()
+        fireParryRemote()
+    end
 end
 
 local function doAbility()
@@ -545,7 +654,7 @@ ParrySection:Toggle("Auto Parry (Key F)", Config.AutoParry, function(v)
     end
 end)
 
-ParrySection:Dropdown("Parry Input Mode", {"F Key", "Mouse"}, Config.ParryMode, function(v)
+ParrySection:Dropdown("Parry Input Mode", {"F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse + Remote)"}, Config.ParryMode, function(v)
     Config.ParryMode = v
 end)
 
@@ -578,7 +687,7 @@ DebugSection:Toggle("On-Screen Telemetry HUD", Config.DebugOverlay, function(v)
     Config.DebugOverlay = v
 end)
 
-VisualsSection:Toggle("3D Parry Range Ring", Config.RangeRing, function(v)
+VisualsSection:Toggle("White Aura Circle (3D Ring)", Config.RangeRing, function(v)
     Config.RangeRing = v
 end)
 
@@ -691,7 +800,7 @@ RunService.Heartbeat:Connect(function()
         State.ball = ballObj
         if not ballObj or not ballObj.Parent or not isReal(ballObj) then
             State.vel = Vector3.new(); State.spd = 0; State.chasing = false
-            State.traj = {}; State.parryCount = 0
+            State.traj = {}; State.parryCount = 0; State.auraRadius = 10
             if (Config.LogBallTarget or Config.DebugConsole) and State.lastChasingState ~= nil and State.lastChasingState ~= false then
                 State.lastChasingState = false
                 print("[BALL TARGET] ⚪ Ball inactive / not found")
@@ -753,9 +862,13 @@ RunService.Heartbeat:Connect(function()
 
         local d = dist(State.pos, hrpPos)
         local tti = State.spd > 0.5 and (d / State.spd) or 99
-        local parryDist = State.spd * (State.targetTTI + (State.ping / 800)) + 2
-        if td.isCurve then parryDist = parryDist * 1.1 end
-        parryDist = math.clamp(parryDist, 6, 32)
+
+        -- Dynamic White Aura Radius calculation: higher ball speed = larger white aura circle
+        local baseAuraRadius = 8
+        local speedFactor = State.spd * (State.targetTTI + (State.ping / 800))
+        local auraRadius = math.clamp(baseAuraRadius + speedFactor, 8, 60)
+        if td.isCurve then auraRadius = auraRadius * 1.15 end
+        State.auraRadius = auraRadius
 
         local dirToPlayer = norm(hrpPos - State.pos)
         local velDir = norm(State.vel)
@@ -794,14 +907,15 @@ RunService.Heartbeat:Connect(function()
         end
 
         ------------------------------------------------------------------------
-        -- STAGE 3: PARRY & CLASH DECISION CHECK
+        -- STAGE 3: PARRY & CLASH DECISION CHECK (WHITE AURA SYSTEM)
         ------------------------------------------------------------------------
         local alreadyParried = State.parriedBall == ballObj and (now - State.parryTime) < 0.5
+        local insideAura = d <= State.auraRadius
 
-        local shouldParry = Config.AutoParry and chr and State.spd >= 10 and not alreadyParried and isFlyingAtPlayer
+        local shouldParry = Config.AutoParry and chr and State.spd >= 5 and not alreadyParried and isFlyingAtPlayer and insideAura
         if shouldParry then
-            if hrp and d > 0 and d <= parryDist then
-                logStage(3, "DECISION -> PARRY TRIGGERED!", string.format("Dist: %.1f <= ParryDist: %.1f | Speed: %.1f | TTI: %.2fs | Ping: %dms | Dot: %.2f", d, parryDist, State.spd, tti, State.ping, dotProd))
+            if hrp then
+                logStage(3, "DECISION -> WHITE AURA PARRY TRIGGERED!", string.format("Dist: %.1f <= AuraRadius: %.1f | Speed: %.1f | TTI: %.2fs | Ping: %dms | Dot: %.2f", d, State.auraRadius, State.spd, tti, State.ping, dotProd))
 
                 doParry()
 
@@ -851,9 +965,9 @@ task.spawn(function()
     if not have_draw then return end
 
     local ogLines, dotObj, ringLines = {}, {}, {}
-    for i = 1, 16 do
+    for i = 1, 24 do
         local l = Drawing.new("Line")
-        if l then l.Visible = false; l.Thickness = 3; l.Transparency = 0 end
+        if l then l.Visible = false; l.Thickness = 2; l.Transparency = 1 end
         ringLines[i] = l
     end
 
@@ -913,7 +1027,7 @@ task.spawn(function()
                 local sr = State.successRate[3] > 0 and math.floor(State.successRate[2]/State.successRate[3]*100) or 0
 
                 local lines = {
-                    "=== Blade Ball Auto Parry (Key F) ===", "",
+                    "=== Blade Ball Auto Parry (" .. tostring(Config.ParryMode) .. ") ===", "",
                     "Ball Detected:", tostring(State.ball ~= nil),
                     "Speed:", math.floor(State.spd) .. " studs/s",
                     "Target:", State.tgt, "Chasing You:", tostring(State.chasing),
@@ -921,7 +1035,7 @@ task.spawn(function()
                     "Distance:", string.format("%.1f studs", d),
                     "Time-To-Impact:", string.format("%.2fs", tti),
                     "Target TTI:", string.format("%.3fs", State.targetTTI),
-                    "Parry Range:", string.format("%.1f studs", pdist),
+                    "Aura Radius:", string.format("%.1f studs", State.auraRadius or 10),
                     "Curving Ball:", tostring(State.isCurving),
                     "Parries Executed:", State.parryCount,
                     "Server Parry Count:", State.serverParryCount or 0,
@@ -956,30 +1070,42 @@ task.spawn(function()
                 end
             end
 
-            -- 3D Range Ring Rendering
-            local calcParryDist = 12
-            if State.ball and State.spd > 0.5 then
-                calcParryDist = math.clamp(State.spd * (State.targetTTI + (State.ping / 800)) + 2 * (State.isCurving and 1.1 or 1.0), 6, 32)
-            end
-            for i = 1, 16 do if ringLines[i] then ringLines[i].Visible = false end end
+            -- 3D White Aura Circle Rendering (matching cathook.lua renderer)
+            for i = 1, 24 do if ringLines[i] then ringLines[i].Visible = false end end
 
             local chr = getLocalCharacter()
-            if Config.RangeRing and chr and State.ball and calcParryDist > 3 then
+            if Config.RangeRing and chr then
                 local hrp = chr:FindFirstChild("HumanoidRootPart") or chr.PrimaryPart
                 if hrp then
-                    local ppos = hrp.Position; local seg = 16
-                    for i = 1, seg do
-                        local a1, a2 = (i-1)/seg*math.pi*2, i/seg*math.pi*2
-                        local py = ppos.Y - 2
-                        local p1 = Vector3.new(ppos.X + math.cos(a1)*calcParryDist, py, ppos.Z + math.sin(a1)*calcParryDist)
-                        local p2 = Vector3.new(ppos.X + math.cos(a2)*calcParryDist, py, ppos.Z + math.sin(a2)*calcParryDist)
-                        local ok1, s1, v1 = pcall(WorldToScreen, p1)
-                        local ok2, s2, v2 = pcall(WorldToScreen, p2)
-                        if ok1 and ok2 and v1 and v2 and ringLines[i] then
-                            ringLines[i].Visible = true
-                            ringLines[i].From = s1; ringLines[i].To = s2
-                            ringLines[i].Color = State.chasing and Color3.fromRGB(100,255,100) or Color3.fromRGB(255,200,100)
-                            ringLines[i].Transparency = 0
+                    local currentAuraRadius = State.auraRadius or 10
+                    if currentAuraRadius > 2 then
+                        local ppos = hrp.Position; local seg = 24
+                        local py = ppos.Y - 3
+                        local screenPoints = {}
+
+                        for i = 1, seg do
+                            local a = (i-1)/seg*math.pi*2
+                            local p = Vector3.new(ppos.X + math.cos(a)*currentAuraRadius, py, ppos.Z + math.sin(a)*currentAuraRadius)
+                            local sv, on = CustomW2S(p)
+                            screenPoints[i] = { pos = sv, visible = on }
+                        end
+
+                        for i = 1, seg do
+                            local nxt = (i % seg) + 1
+                            local p1 = screenPoints[i]
+                            local p2 = screenPoints[nxt]
+                            local line = ringLines[i]
+
+                            if line and p1.visible and p2.visible then
+                                line.From = p1.pos
+                                line.To = p2.pos
+                                line.Color = Color3.fromRGB(255, 255, 255)
+                                line.Thickness = 2
+                                line.Transparency = 1
+                                line.Visible = true
+                            elseif line then
+                                line.Visible = false
+                            end
                         end
                     end
                 end
