@@ -1,7 +1,12 @@
-local Lib = pcall(function()
-    return loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))()
+local Lib
+local success, result = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/akvarium11/PaidBladeBall/refs/heads/master/BladeBall/uilib.lua"))()
 end)
-if type(Lib) == "boolean" or not Lib then Lib = rawget(_G, "INSui") end
+if success and result then
+    Lib = result
+else
+    Lib = rawget(_G, "INSui") or INSui
+end
 
 -- Services
 local Players = game:GetService("Players")

@@ -1,4 +1,12 @@
-local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSui
+local Lib
+local success, result = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/akvarium11/PaidBladeBall/refs/heads/master/BladeBall/uilib.lua"))()
+end)
+if success and result then
+    Lib = result
+else
+    Lib = rawget(_G, "INSui") or INSui
+end
 
 local Window = Lib:CreateWindow({
     title = "Blade Ball",
