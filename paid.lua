@@ -1,20 +1,7 @@
-local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSui
-
-local Window = Lib:CreateWindow({
-    title = "Blade Ball",
-    subtitle = "Matcha AP",
-    size = Vector2.new(680, 520),
-    menuKey = "p",
-    configName = "bladeball",
-    configFolder = "bladeball",
-    accentA = Color3.fromRGB(122, 134, 255),
-    accentB = Color3.fromRGB(189, 130, 255),
-    startOpen = true,
-    keybindOverlay = false,
-    checkboxStyle = true,
-    smartFps = true,
-    autoSave = true,
-})
+local Lib = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))()
+end)
+if type(Lib) == "boolean" or not Lib then Lib = rawget(_G, "INSui") end
 
 -- Services
 local Players = game:GetService("Players")
@@ -25,427 +12,31 @@ local StatsService = game:GetService("Stats")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local lp = Players.LocalPlayer
-local mouse = lp and lp:GetMouse()
 
 --------------------------------------------------------------------------------
 -- Config & Global State
 --------------------------------------------------------------------------------
 local Config = {
     AutoParry = false,
-    ParryMode = "F Key", -- "F Key" or "Mouse"
-    AutoClash = false,
-    ClashRange = 20,
-    ClashMinSpeed = 40,
+    ParryMode = "F Key", -- "F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse + Remote)"
+    MinAuraRadius = 18,  -- Minimum aura circle radius (studs)
     AutoAbility = false,
-    DebugConsole = true, -- Logs Stage 1-5 to F9 developer console
-    DebugOverlay = true, -- On-screen telemetry panel
+    DebugConsole = true, -- Logs target threat & parry triggers to F9 developer console
     RangeRing = true,    -- Draws 3D floor ring for parry distance
     Trajectory = true,   -- Draws ball flight trajectory line
-    BallDebug = true,    -- Ball & Player attributes debug overlay
-    BallDebugConsole = false, -- Logs attribute changes to F9 console
-    LogBallTarget = true,    -- Logs whether ball is flying at player to console
 }
 
 local State = {
-    ball = nil,
-    vel = Vector3.new(),
-    spd = 0,
-    pos = Vector3.new(),
-    tgt = "",
-    chasing = false,
-    ping = 60,
-    lastAb = 0,
-    traj = {},
-    isCurving = false,
-    lastDot = 1,
-    prevVel = Vector3.new(),
+    auraRadius = 18,
+    lastParryTime = 0,
     parryCount = 0,
-    serverParryCount = 0,
-    isParrying = false,
-    parriedBall = nil,
-    parryTime = 0,
-    targetTTI = 0.18,  -- initial 180ms timing, auto-adjusts dynamically
-    auraRadius = 10,   -- dynamic white aura circle radius
-    parriedAt = 0,
-    checkBall = nil,
-    checkTime = 0,
-    checkTTI = 0,
-    successRate = {50, 0, 0}, -- {window, successes, total}
-    errs = {},
-    loop = 0,
-    lastStageLogged = "",
-    lastBallAttrs = "",
-    lastPlayerAttrs = "",
-    lastBallPath = "",
-    lastPlayerPath = "",
-    lastChasingState = nil,
-    lastTgt = "",
+    lastThreatState = nil,
+    lastAbilityTime = 0,
+    ping = 60,
 }
 
 --------------------------------------------------------------------------------
--- Stage-by-Stage Debug Logger
---------------------------------------------------------------------------------
-local function logStage(stage, title, details)
-    if not Config.DebugConsole then return end
-    local logMsg = string.format("[AP STAGE %d - %s] %s", stage, title, details or "")
-    if State.lastStageLogged ~= logMsg then
-        State.lastStageLogged = logMsg
-        print(logMsg)
-    end
-end
-
---------------------------------------------------------------------------------
--- Helper Math & Vector Functions
---------------------------------------------------------------------------------
-local function dot(a, b) return a and b and (a.X*b.X + a.Y*b.Y + a.Z*b.Z) or 0 end
-local function mag(v) return v and math.sqrt(v.X^2 + v.Y^2 + v.Z^2) or 0 end
-local function norm(v)
-    local m = mag(v)
-    return m > 0 and Vector3.new(v.X/m, v.Y/m, v.Z/m) or Vector3.new()
-end
-local function dist(a, b) return a and b and mag(a - b) or 9999 end
-local function sub(a, b) return a and b and (a - b) or Vector3.new() end
-
-local function CustomW2S(pos)
-    if not pos then return Vector2.new(0, 0), false end
-    local res1, res2 = nil, nil
-    if type(WorldToScreen) == "function" then
-        local ok, r1, r2 = pcall(WorldToScreen, pos)
-        if ok and r1 then res1, res2 = r1, r2 end
-    elseif type(w2s) == "function" then
-        local ok, r1, r2 = pcall(w2s, pos)
-        if ok and r1 then res1, res2 = r1, r2 end
-    end
-    if not res1 then
-        local camera = game.Workspace.CurrentCamera
-        if camera then
-            local ok, sp, inViewport = pcall(function() return camera:WorldToViewportPoint(pos) end)
-            if ok and sp then
-                res1 = sp
-                res2 = inViewport
-            end
-        end
-    end
-    if not res1 then return Vector2.new(0, 0), false end
-    local screenVec = Vector2.new(0, 0)
-    local onScreen = false
-    if typeof(res1) == "Vector3" then
-        screenVec = Vector2.new(res1.X, res1.Y)
-        if type(res2) == "boolean" then
-            onScreen = res2 and (res1.Z > 0)
-        else
-            onScreen = (res1.Z > 0)
-        end
-    elseif typeof(res1) == "Vector2" then
-        screenVec = res1
-        if type(res2) == "boolean" then
-            onScreen = res2
-        elseif type(res2) == "number" then
-            onScreen = res2 > 0
-        else
-            onScreen = true
-        end
-    end
-    return screenVec, onScreen
-end
-
-local function attr(c, k)
-    if not c then return nil end
-    local ok, v = pcall(function() return c:GetAttribute(k) end)
-    return ok and v or nil
-end
-
-local function parseVector3(val)
-    if not val then return nil end
-    if typeof(val) == "Vector3" then
-        return val
-    elseif type(val) == "table" or typeof(val) == "table" or type(val) == "userdata" then
-        local x = val.X or val.x or val[1]
-        local y = val.Y or val.y or val[2]
-        local z = val.Z or val.z or val[3]
-        if type(x) == "number" and type(y) == "number" and type(z) == "number" then
-            return Vector3.new(x, y, z)
-        end
-    end
-    return nil
-end
-
-local function parsePosition(val)
-    if not val then return nil end
-    if typeof(val) == "Vector3" then
-        return val
-    elseif typeof(val) == "CFrame" then
-        return val.Position
-    elseif type(val) == "table" or typeof(val) == "table" or type(val) == "userdata" then
-        if val.Position then return parsePosition(val.Position) end
-        if val.position then return parsePosition(val.position) end
-        if val.p then return parsePosition(val.p) end
-        local x = val.X or val.x or val[1]
-        local y = val.Y or val.y or val[2]
-        local z = val.Z or val.z or val[3]
-        if type(x) == "number" and type(y) == "number" and type(z) == "number" then
-            return Vector3.new(x, y, z)
-        end
-    end
-    return nil
-end
-
-local function formatAttrValue(v)
-    if typeof(v) == "Vector3" then
-        return string.format("Vector3(%.1f, %.1f, %.1f)", v.X, v.Y, v.Z)
-    elseif typeof(v) == "CFrame" then
-        return string.format("CFrame(%.1f, %.1f, %.1f)", v.Position.X, v.Position.Y, v.Position.Z)
-    end
-    local pv = parseVector3(v)
-    if pv then
-        return string.format("Vector3(%.1f, %.1f, %.1f)", pv.X, pv.Y, pv.Z)
-    end
-    local pp = parsePosition(v)
-    if pp then
-        return string.format("Position(%.1f, %.1f, %.1f)", pp.X, pp.Y, pp.Z)
-    end
-    return tostring(v)
-end
-
---------------------------------------------------------------------------------
--- Folder & Player Scanners
---------------------------------------------------------------------------------
-local function findBalls()
-    local la = rawget(_G, "LuaApp")
-    if not la then pcall(function() la = game:GetService("LuaApp") end) end
-    if not la then la = game:FindFirstChild("LuaApp") end
-    if la then
-        local w = la:FindFirstChild("Workspace") or la
-        local b = w:FindFirstChild("Balls")
-        if b then return b end
-    end
-    return Workspace:FindFirstChild("Balls")
-end
-
-local function findAliveFolder()
-    local la = rawget(_G, "LuaApp")
-    if not la then pcall(function() la = game:GetService("LuaApp") end) end
-    if not la then la = game:FindFirstChild("LuaApp") end
-    if la then
-        local w = la:FindFirstChild("Workspace") or la
-        local alive = w:FindFirstChild("Alive")
-        if alive then return alive end
-    end
-    return Workspace:FindFirstChild("Alive")
-end
-
-local function getLocalCharacter()
-    if not lp then return nil end
-    local aliveFolder = findAliveFolder()
-    if aliveFolder then
-        local char = aliveFolder:FindFirstChild(lp.Name)
-        if char then return char end
-    end
-    return lp.Character
-end
-
-local function getAlivePlayer()
-    return getLocalCharacter()
-end
-
-local function isReal(c)
-    if not c then return false end
-
-    -- Check realBall attribute on ball model
-    local r1 = attr(c, "realBall")
-    if r1 == false then return false end
-
-    -- Check realBall attribute on Body part
-    local body = c:FindFirstChild("Body") or c:FindFirstChild("body") or c:FindFirstChildWhichIsA("BasePart")
-    if body then
-        local r2 = attr(body, "realBall")
-        if r2 == false then return false end
-        if r2 == true then return true end
-    end
-
-    if r1 == true then return true end
-
-    if c.Name == "Ball" then return true end
-    return false
-end
-
-local function getBallBodyInstance()
-    local ballsFolder = findBalls()
-    if ballsFolder then
-        local ball = ballsFolder:FindFirstChild("Ball")
-        if ball then
-            local body = ball:FindFirstChild("Body") or ball:FindFirstChild("body") or ball:FindFirstChildWhichIsA("BasePart")
-            if body then return body, ball end
-        end
-        for _, c in ipairs(ballsFolder:GetChildren()) do
-            local body = c:FindFirstChild("Body") or c:FindFirstChild("body") or c:FindFirstChildWhichIsA("BasePart")
-            if body then return body, c end
-        end
-    end
-    for _, c in ipairs(Workspace:GetChildren()) do
-        if c.Name == "Ball" or isReal(c) then
-            local body = c:FindFirstChild("Body") or c:FindFirstChild("body") or c:FindFirstChildWhichIsA("BasePart")
-            if body then return body, c end
-        end
-    end
-    return nil, nil
-end
-
-local function getBallInstance()
-    local body, ball = getBallBodyInstance()
-    if ball then return ball end
-    local ballsFolder = findBalls()
-    if ballsFolder then
-        local b = ballsFolder:FindFirstChild("Ball")
-        if b then return b end
-        for _, c in ipairs(ballsFolder:GetChildren()) do
-            if isReal(c) then return c end
-        end
-        local first = ballsFolder:GetChildren()[1]
-        if first then return first end
-    end
-    for _, c in ipairs(Workspace:GetChildren()) do
-        if c.Name == "Ball" or isReal(c) then return c end
-    end
-    return nil
-end
-
-local function bvel(obj)
-    if not obj then return Vector3.new() end
-    local body = obj:FindFirstChild("Body") or obj:FindFirstChild("body") or obj:FindFirstChildWhichIsA("BasePart") or obj.PrimaryPart or obj
-    if body then
-        local ok, v = pcall(function() return body.AssemblyLinearVelocity end)
-        if ok and v and mag(v) > 0.001 then return v end
-        local ok2, v2 = pcall(function() return body.Velocity end)
-        if ok2 and v2 and mag(v2) > 0.001 then return v2 end
-        local vAttr = attr(body, "Velocity") or attr(obj, "Velocity")
-        local parsedV = parseVector3(vAttr)
-        if parsedV and mag(parsedV) > 0.001 then return parsedV end
-    end
-    local ok, v = pcall(function() return obj.AssemblyLinearVelocity end)
-    if ok and v and mag(v) > 0.001 then return v end
-    local ok2, v2 = pcall(function() return obj.Velocity end)
-    if ok2 and v2 and mag(v2) > 0.001 then return v2 end
-    local vAttr = attr(obj, "Velocity")
-    local parsedV = parseVector3(vAttr)
-    if parsedV and mag(parsedV) > 0.001 then return parsedV end
-    return Vector3.new()
-end
-
-local function bpos(obj)
-    if not obj then return Vector3.new() end
-    local body = obj:FindFirstChild("Body") or obj:FindFirstChild("body") or obj:FindFirstChildWhichIsA("BasePart") or obj.PrimaryPart or obj
-    if body then
-        local ok, p = pcall(function() return body.Position end)
-        if ok and p then return p end
-        local ok2, cf = pcall(function() return body:GetPivot() end)
-        if ok2 and cf then return cf.Position end
-        local pAttr = attr(body, "Position") or attr(body, "Pivot") or attr(obj, "Position") or attr(obj, "Pivot")
-        local parsedP = parsePosition(pAttr)
-        if parsedP then return parsedP end
-    end
-    local ok, p = pcall(function() return obj.Position end)
-    if ok and p then return p end
-    local ok2, cf = pcall(function() return obj:GetPivot() end)
-    if ok2 and cf then return cf.Position end
-    local pAttr = attr(obj, "Position") or attr(obj, "Pivot")
-    local parsedP = parsePosition(pAttr)
-    if parsedP then return parsedP end
-    return Vector3.new()
-end
-
---------------------------------------------------------------------------------
--- Target Resolution Logic (Attribute & Vector Based)
---------------------------------------------------------------------------------
-local function resolveTarget(ballObj)
-    if not ballObj then return "", false end
-
-    local aliveP = getAlivePlayer()
-    local myName = lp and lp.Name or ""
-
-    local body = ballObj:FindFirstChild("Body") or ballObj:FindFirstChild("body") or ballObj:FindFirstChildWhichIsA("BasePart")
-
-    -- 1. Check Ball or Ball.Body attributes directly (target / targetPlayer)
-    local targetAttr = attr(ballObj, "target") or attr(ballObj, "Target") or attr(ballObj, "targetPlayer") or attr(ballObj, "TargetPlayer")
-    if not targetAttr or targetAttr == "" then
-        if body then
-            targetAttr = attr(body, "target") or attr(body, "Target") or attr(body, "targetPlayer") or attr(body, "TargetPlayer")
-        end
-    end
-
-    if targetAttr and targetAttr ~= "" and targetAttr ~= false then
-        if typeof(targetAttr) == "Instance" then
-            if targetAttr == lp or targetAttr == lp.Character or targetAttr == aliveP then
-                return myName, true
-            else
-                return targetAttr.Name, (string.lower(targetAttr.Name) == string.lower(myName))
-            end
-        elseif type(targetAttr) == "string" then
-            local isMe = (string.lower(targetAttr) == string.lower(myName))
-            return targetAttr, isMe
-        end
-    end
-
-    -- 2. Check ValueBase children inside Ball or Body
-    local targetValObj = ballObj:FindFirstChild("target") or ballObj:FindFirstChild("Target") or ballObj:FindFirstChild("targetPlayer") or ballObj:FindFirstChild("TargetPlayer")
-    if not targetValObj and body then
-        targetValObj = body:FindFirstChild("target") or body:FindFirstChild("Target") or body:FindFirstChild("targetPlayer") or body:FindFirstChild("TargetPlayer")
-    end
-    if targetValObj and targetValObj:IsA("ValueBase") and targetValObj.Value then
-        local val = targetValObj.Value
-        if typeof(val) == "Instance" then
-            local isMe = (val == lp or val == lp.Character or val == aliveP)
-            return val.Name, isMe
-        elseif type(val) == "string" and val ~= "" then
-            local isMe = (string.lower(val) == string.lower(myName))
-            return val, isMe
-        end
-    end
-
-    -- 3. Check IsTarget / Target attribute on character in Alive folder
-    local aliveFolder = findAliveFolder()
-    if aliveFolder then
-        for _, char in ipairs(aliveFolder:GetChildren()) do
-            local isT = attr(char, "IsTarget") or attr(char, "isTarget")
-            if isT == true then
-                local charName = char.Name
-                local isMe = (string.lower(charName) == string.lower(myName))
-                return charName, isMe
-            end
-        end
-    end
-
-    -- 4. Vector Trajectory Precision Fallback (Projected trajectory towards LocalPlayer)
-    if aliveP then
-        local hrp = aliveP:FindFirstChild("HumanoidRootPart") or aliveP.PrimaryPart
-        if hrp then
-            local pos = bpos(ballObj)
-            local vel = bvel(ballObj)
-            local speed = mag(vel)
-            local distToP = dist(pos, hrp.Position)
-            if speed > 10 and distToP > 0 and distToP < 120 then
-                local dirToP = norm(hrp.Position - pos)
-                local velDir = norm(vel)
-                local dotProd = dot(velDir, dirToP)
-                local perpDist = distToP * math.sqrt(math.max(0, 1 - dotProd^2))
-                -- Heading directly at player (dot > 0.92) with tight miss offset (< 12 studs)
-                if dotProd > 0.92 and perpDist < 12 then
-                    return (myName ~= "" and (myName .. " (Vector Threat)") or "You (Vector Threat)"), true
-                end
-            end
-        end
-    end
-
-    return "", false
-end
-
-local function targetOf(ballObj)
-    local tgtName, _ = resolveTarget(ballObj)
-    return tgtName
-end
-
---------------------------------------------------------------------------------
--- Ping Calculation & Smoothing
+-- Ping & Math Helpers
 --------------------------------------------------------------------------------
 local pingStatsItem
 local function getPing()
@@ -463,140 +54,228 @@ local function getPing()
     return ok and v or 60
 end
 
-local pingHist = {}
-local function smoothedPing()
-    local raw = getPing()
-    table.insert(pingHist, raw)
-    if #pingHist > 50 then table.remove(pingHist, 1) end
-    if #pingHist == 0 then return raw end
-    local maxP, sumP = 0, 0
-    for _, p in ipairs(pingHist) do maxP = math.max(maxP, p); sumP = sumP + p end
-    local avgP = sumP / #pingHist
-    if (maxP - avgP) > 20 then return maxP + 10 end
-    return raw
+local function getLocalCharacter()
+    if not lp then return nil end
+    local aliveFolder = Workspace:FindFirstChild("Alive")
+    if aliveFolder then
+        local char = aliveFolder:FindFirstChild(lp.Name)
+        if char then return char end
+    end
+    return lp.Character
 end
 
-
-
-local function getAttributesDict(inst)
-    if not inst then return {} end
-    local dict = {}
-    local ok, raw = pcall(function() return inst:GetAttributes() end)
-    if ok and type(raw) == "table" then
-        for k, v in pairs(raw) do
-            if type(k) == "string" then
-                dict[k] = v
-            elseif type(v) == "string" then
-                dict[v] = attr(inst, v)
-            end
+local function CustomW2S(pos)
+    if not pos then return Vector2.new(0, 0), false end
+    local camera = Workspace.CurrentCamera
+    if camera then
+        local ok, sp, inViewport = pcall(function() return camera:WorldToViewportPoint(pos) end)
+        if ok and sp then
+            return Vector2.new(sp.X, sp.Y), inViewport and (sp.Z > 0)
         end
     end
-    return dict
-end
-
-local function formatAttributes(inst)
-    if not inst then return "(None)" end
-    local attrs = getAttributesDict(inst)
-    local parts = {}
-    for k, v in pairs(attrs) do
-        table.insert(parts, tostring(k) .. "=" .. formatAttrValue(v))
-    end
-    local body = inst:FindFirstChild("Body") or inst:FindFirstChild("body") or inst:FindFirstChildWhichIsA("BasePart")
-    if body then
-        local bodyAttrs = getAttributesDict(body)
-        for k, v in pairs(bodyAttrs) do
-            table.insert(parts, "Body." .. tostring(k) .. "=" .. formatAttrValue(v))
-        end
-    end
-    table.sort(parts)
-    if #parts == 0 then
-        return "(No Attributes)"
-    end
-    return table.concat(parts, ", ")
+    return Vector2.new(0, 0), false
 end
 
 --------------------------------------------------------------------------------
--- Parry & Ability Action Execution (F Key, LMB, Remote)
+-- Anti-Cheat Ball Resolver (Low-Latency Responsive Trajectory Tracker)
 --------------------------------------------------------------------------------
+local Resolver = {
+    rawPos = Vector3.new(),
+    resolvedPos = Vector3.new(),
+    resolvedVel = Vector3.new(),
+    spd = 0,
+    lastValidTime = 0,
+    outlierCount = 0,
+    validCount = 0,
+    samples = {},
+}
 
--- Direct Server Remote Parry Trigger
-local function fireParryRemote()
-    local success = false
-    pcall(function()
-        local remotes = ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage:FindFirstChild("remotes")
-        if remotes then
-            local pb = remotes:FindFirstChild("ParryButtonPress") or remotes:FindFirstChild("ParryAttempt") or remotes:FindFirstChild("Parry")
-            if pb and pb:IsA("RemoteEvent") then
-                pb:FireServer()
-                success = true
-                return
-            end
-        end
-        for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-            if obj:IsA("RemoteEvent") and (obj.Name:find("Parry") or obj.Name:find("parry")) then
-                obj:FireServer()
-                success = true
-                return
-            end
-        end
-    end)
-    return success
+function Resolver:Reset()
+    self.rawPos = Vector3.new()
+    self.resolvedPos = Vector3.new()
+    self.resolvedVel = Vector3.new()
+    self.spd = 0
+    self.lastValidTime = 0
+    self.outlierCount = 0
+    self.validCount = 0
+    self.samples = {}
 end
 
--- Physical Key F press (Non-blocking with setrobloxinput focus)
+function Resolver:Update(part, dt)
+    if not part or not part.Parent then
+        self:Reset()
+        return false
+    end
+
+    local raw = part.Position
+    self.rawPos = raw
+    local now = tick()
+
+    if self.validCount == 0 or self.resolvedPos == Vector3.new() then
+        self.resolvedPos = raw
+        self.resolvedVel = Vector3.new()
+        self.spd = 0
+        self.lastValidTime = now
+        self.validCount = 1
+        return true
+    end
+
+    dt = math.clamp(dt, 0.001, 0.1)
+
+    -- Expected position based on current resolved velocity vector
+    local predictedPos = self.resolvedPos + self.resolvedVel * dt
+    local posErr = (raw - predictedPos).Magnitude
+    local rawSpeed = (raw - self.resolvedPos).Magnitude / dt
+
+    -- Filter Criteria:
+    -- 1. Error from predicted physical trajectory is reasonable (< 45 studs)
+    -- OR 2. Raw movement speed between ticks is within realistic speed (< 450 studs/s)
+    local isValid = (posErr < 45) or (rawSpeed < 450)
+
+    if not isValid then
+        self.outlierCount = self.outlierCount + 1
+        table.insert(self.samples, raw)
+        if #self.samples > 4 then table.remove(self.samples, 1) end
+
+        -- If raw positions consistently cluster over multiple updates, re-anchor trajectory immediately
+        if #self.samples >= 2 then
+            local p1 = self.samples[#self.samples]
+            local p2 = self.samples[#self.samples - 1]
+            local clusterSpeed = (p1 - p2).Magnitude / dt
+            if clusterSpeed < 450 then
+                isValid = true
+                self.resolvedPos = p1
+                self.resolvedVel = (p1 - p2) / dt
+                self.samples = {}
+            end
+        end
+    else
+        self.samples = {}
+    end
+
+    if isValid then
+        -- Accept sample with fast 0.70 LERP for minimal tracking lag
+        local calcVel = (raw - self.resolvedPos) / dt
+        self.resolvedPos = self.resolvedPos:Lerp(raw, 0.70)
+        self.resolvedVel = self.resolvedVel:Lerp(calcVel, 0.65)
+        self.spd = self.resolvedVel.Magnitude
+        self.lastValidTime = now
+        self.validCount = self.validCount + 1
+    else
+        -- Reject fake teleport jump from anti-cheat
+        -- Advance predicted position along current trajectory
+        self.resolvedPos = self.resolvedPos + self.resolvedVel * dt
+        self.spd = self.resolvedVel.Magnitude
+    end
+
+    return true
+end
+
+--------------------------------------------------------------------------------
+-- Ball Instance Binding (game.Workspace.Part)
+--------------------------------------------------------------------------------
+local function getBallPart()
+    local part = Workspace:FindFirstChild("Part")
+    if part and part:IsA("BasePart") then
+        return part
+    end
+    for _, obj in ipairs(Workspace:GetChildren()) do
+        if obj.Name == "Part" and obj:IsA("BasePart") then
+            return obj
+        end
+    end
+    return nil
+end
+
+--------------------------------------------------------------------------------
+-- Strict Directional Threat Scanning (Prevents false triggers when standing near)
+--------------------------------------------------------------------------------
+local function scanBallDirection()
+    local chr = getLocalCharacter()
+    if not chr then return false, 0, 999, 999, 999 end
+    local hrp = chr:FindFirstChild("HumanoidRootPart") or chr.PrimaryPart
+    if not hrp then return false, 0, 999, 999, 999 end
+
+    local ballPos = Resolver.resolvedPos
+    local ballVel = Resolver.resolvedVel
+    local ballSpeed = Resolver.spd
+
+    local distToPlayer = (hrp.Position - ballPos).Magnitude
+
+    -- Require ball to be moving at physical flying speed (> 6 studs/s)
+    if ballSpeed < 6 then
+        return false, 0, distToPlayer, 999, 999
+    end
+
+    local dirToPlayer = (hrp.Position - ballPos).Unit
+    local velDir = ballVel.Unit
+
+    local dotProd = velDir:Dot(dirToPlayer)
+    local perpDist = distToPlayer * math.sqrt(math.max(0, 1 - dotProd^2))
+    local tti = distToPlayer / math.max(ballSpeed, 0.1)
+
+    -- STRICT Directional Threat Criteria:
+    -- 1. Velocity vector MUST point directly at local player (dotProd > 0.88)
+    -- 2. Perpendicular trajectory miss distance MUST be tight (< 6.5 studs)
+    -- (This prevents false triggers when player is standing near the ball or when ball flies past)
+    local isThreat = false
+    if dotProd > 0.88 and perpDist < 6.5 then
+        isThreat = true
+    end
+
+    return isThreat, dotProd, distToPlayer, tti, perpDist
+end
+
+--------------------------------------------------------------------------------
+-- Parry & Ability Action Execution (F Key, Mouse, Remote)
+--------------------------------------------------------------------------------
 local function pressFKey()
     pcall(function() setrobloxinput(true) end)
 
-    -- Method 1: VirtualInputManager Key F
     if VirtualInputManager then
         pcall(function()
             VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
             task.spawn(function()
-                task.wait(0.03)
+                task.wait(0.02)
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
             end)
         end)
     end
 
-    -- Method 2: Executor native keyclick / keypress (0x46 = 'F')
     if type(keyclick) == "function" then
         pcall(function() keyclick(0x46) end)
     elseif type(keypress) == "function" then
         pcall(function()
             keypress(0x46)
             task.spawn(function()
-                task.wait(0.03)
+                task.wait(0.02)
                 if type(keyrelease) == "function" then keyrelease(0x46) end
             end)
         end)
     end
 end
 
--- Physical LMB (Left Mouse Button) press (Non-blocking with setrobloxinput focus)
 local function pressLMB()
     pcall(function() setrobloxinput(true) end)
 
-    -- Method 1: VirtualInputManager MouseButton1
     if VirtualInputManager then
         pcall(function()
             local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(500, 500)
-            local vx, vy = vp.X / 2, vp.Y / 2
-            VirtualInputManager:SendMouseButtonEvent(vx, vy, 0, true, game, 1)
+            VirtualInputManager:SendMouseButtonEvent(vp.X / 2, vp.Y / 2, 0, true, game, 1)
             task.spawn(function()
-                task.wait(0.03)
-                VirtualInputManager:SendMouseButtonEvent(vx, vy, 0, false, game, 1)
+                task.wait(0.02)
+                VirtualInputManager:SendMouseButtonEvent(vp.X / 2, vp.Y / 2, 0, false, game, 1)
             end)
         end)
     end
 
-    -- Method 2: Executor native mouse functions
     if type(mouse1click) == "function" then
         pcall(mouse1click)
     elseif type(mouse1press) == "function" then
         pcall(function()
             mouse1press()
             task.spawn(function()
-                task.wait(0.03)
+                task.wait(0.02)
                 if type(mouse1release) == "function" then mouse1release() end
             end)
         end)
@@ -604,11 +283,26 @@ local function pressLMB()
     if type(click) == "function" then pcall(click) end
 end
 
+local function fireParryRemote()
+    pcall(function()
+        local remotes = ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage:FindFirstChild("remotes")
+        if remotes then
+            local pb = remotes:FindFirstChild("ParryButtonPress") or remotes:FindFirstChild("ParryAttempt") or remotes:FindFirstChild("Parry")
+            if pb and pb:IsA("RemoteEvent") then
+                pcall(function() pb:FireServer() end)
+                return
+            end
+        end
+        for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
+            if obj:IsA("RemoteEvent") and (obj.Name:find("Parry") or obj.Name:find("parry")) then
+                pcall(function() obj:FireServer() end)
+                return
+            end
+        end
+    end)
+end
+
 local function doParry()
-    logStage(4, "EXECUTION", string.format("Action: Parry Triggered | Mode: %s | Ball Speed: %.1f", Config.ParryMode, State.spd))
-
-    pcall(function() setrobloxinput(true) end)
-
     local mode = Config.ParryMode
     if mode == "F Key" then
         pressFKey()
@@ -628,505 +322,177 @@ local function doParry()
 end
 
 local function doAbility()
-    local r = ReplicatedStorage:FindFirstChild("Remotes")
-    local ar = r and r:FindFirstChild("AbilityButtonPress")
-    if ar then
-        pcall(function() ar:FireServer() end)
-        logStage(4, "ABILITY", "Auto Ability Triggered!")
-    end
+    pcall(function()
+        local r = ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage:FindFirstChild("remotes")
+        local ar = r and (r:FindFirstChild("AbilityButtonPress") or r:FindFirstChild("Ability"))
+        if ar and ar:IsA("RemoteEvent") then
+            pcall(function() ar:FireServer() end)
+            if Config.DebugConsole then
+                print("[AutoParry] ⚡ Auto Ability Triggered!")
+            end
+        end
+    end)
 end
 
 --------------------------------------------------------------------------------
--- Tabs & UI Layout (INS-ui)
+-- Main Loop (Heartbeat Thread with Latency Lead Compensation)
 --------------------------------------------------------------------------------
-local Main = Window:Tab("Auto Parry", "swords")
-local VisTab = Window:Tab("Visuals & Debug", "eye")
-
-local ParrySection = Main:Section("Parry Core", "Left", "Automatic ball deflection with F key")
-local ClashSection = Main:Section("Clash & Ability", "Right", "High-speed clash mode & abilities")
-
-ParrySection:Toggle("Auto Parry (Key F)", Config.AutoParry, function(v)
-    Config.AutoParry = v
-    if v then
-        logStage(1, "SYSTEM", "Auto Parry Activated (Key F Mode)")
-    else
-        logStage(1, "SYSTEM", "Auto Parry Deactivated")
-    end
-end)
-
-ParrySection:Dropdown("Parry Input Mode", {"F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse + Remote)"}, Config.ParryMode, function(v)
-    Config.ParryMode = v
-end)
-
-ClashSection:Toggle("Auto Clash", Config.AutoClash, function(v)
-    Config.AutoClash = v
-end)
-
-ClashSection:Slider("Clash Distance", 5, 40, Config.ClashRange, function(v)
-    Config.ClashRange = v
-end)
-
-ClashSection:Slider("Clash Min Speed", 10, 100, Config.ClashMinSpeed, function(v)
-    Config.ClashMinSpeed = v
-end)
-
-ClashSection:Toggle("Auto Ability", Config.AutoAbility, function(v)
-    Config.AutoAbility = v
-end)
-
--- Visuals & Debug Section
-local DebugSection = VisTab:Section("Stage Debug & HUD", "Left", "Console logs and telemetry overlay")
-local VisualsSection = VisTab:Section("Render Settings", "Right", "3D distance ring and trajectory line")
-local BallDebugSection = VisTab:Section("Ball & Player Debug", "Left", "Attribute inspector for LuaApp.Workspace")
-
-DebugSection:Toggle("Stage Debug Console Logs", Config.DebugConsole, function(v)
-    Config.DebugConsole = v
-end)
-
-DebugSection:Toggle("On-Screen Telemetry HUD", Config.DebugOverlay, function(v)
-    Config.DebugOverlay = v
-end)
-
-VisualsSection:Toggle("White Aura Circle (3D Ring)", Config.RangeRing, function(v)
-    Config.RangeRing = v
-end)
-
-VisualsSection:Toggle("Ball Flight Trajectory", Config.Trajectory, function(v)
-    Config.Trajectory = v
-end)
-
-BallDebugSection:Toggle("Ball & Player Debug HUD", Config.BallDebug, function(v)
-    Config.BallDebug = v
-end)
-
-BallDebugSection:Toggle("Print Attributes to Console", Config.BallDebugConsole, function(v)
-    Config.BallDebugConsole = v
-end)
-
-BallDebugSection:Toggle("Log Ball Target to Console", Config.LogBallTarget, function(v)
-    Config.LogBallTarget = v
-end)
-
---------------------------------------------------------------------------------
--- Main Heartbeat Loop (Stages 1 - 5 Logic)
---------------------------------------------------------------------------------
-local ballContainer, lastScan = nil, 0
+local lastTime = tick()
 
 RunService.Heartbeat:Connect(function()
-    local ok, err = pcall(function()
-        local now = tick()
-        State.loop = State.loop + 1
+    local now = tick()
+    local dt = now - lastTime
+    lastTime = now
 
-        ------------------------------------------------------------------------
-        -- BALL & PLAYER DEBUG ATTRIBUTES TRACKING
-        ------------------------------------------------------------------------
-        local currentBall = getBallInstance()
-        local currentAlivePlayer = getAlivePlayer()
+    State.ping = getPing()
 
-        local bPath = currentBall and currentBall:GetFullName() or "None"
-        local bAttrsStr = formatAttributes(currentBall)
-
-        local pPath = currentAlivePlayer and currentAlivePlayer:GetFullName() or "None"
-        local pAttrsStr = formatAttributes(currentAlivePlayer)
-
-        if Config.BallDebugConsole then
-            if bAttrsStr ~= State.lastBallAttrs or bPath ~= State.lastBallPath then
-                print(string.format("[BALL DEBUG] %s Attributes: %s", bPath, bAttrsStr))
-            end
-            if pAttrsStr ~= State.lastPlayerAttrs or pPath ~= State.lastPlayerPath then
-                print(string.format("[PLAYER DEBUG] %s Attributes: %s", pPath, pAttrsStr))
-            end
+    local part = getBallPart()
+    if not part then
+        Resolver:Reset()
+        if Config.DebugConsole and State.lastThreatState ~= nil and State.lastThreatState ~= false then
+            State.lastThreatState = false
+            print("[AutoParry] ⚪ Ball (game.Workspace.Part) not found / inactive")
         end
+        return
+    end
 
-        State.lastBallAttrs = bAttrsStr
-        State.lastBallPath = bPath
-        State.lastPlayerAttrs = pAttrsStr
-        State.lastPlayerPath = pPath
+    Resolver:Update(part, dt)
 
-        State.ping = smoothedPing()
+    local isThreat, dotProd, distToPlayer, tti, perpDist = scanBallDirection()
 
-        ------------------------------------------------------------------------
-        -- STAGE 5: POST-PARRY FEEDBACK & AUTO-TUNING
-        ------------------------------------------------------------------------
-        if State.checkBall and now > State.checkTime then
-            if State.checkBall.Parent then
-                local cv = bvel(State.checkBall)
-                local cp = bpos(State.checkBall)
-                local chr2 = getLocalCharacter()
-                if chr2 and cv.Magnitude > 1 then
-                    local hrp2 = chr2:FindFirstChild("HumanoidRootPart") or chr2.PrimaryPart
-                    if hrp2 then
-                        local toP = norm(hrp2.Position - cp)
-                        local toward = dot(norm(cv), toP) > 0
-                        if toward then
-                            -- Failed deflection / parried too late -> increase target TTI (parry earlier next time)
-                            State.targetTTI = math.min(State.targetTTI + 0.008, 0.5)
-                            State.successRate[3] = State.successRate[3] + 1
-                            logStage(5, "AUTO-TUNE", string.format("Outcome: FAIL (Ball still flying at player) | Adjust TTI -> %.3fs", State.targetTTI))
-                        else
-                            -- Successful deflection -> slightly tighten target TTI
-                            State.targetTTI = math.max(State.targetTTI - 0.004, 0.05)
-                            State.successRate[2] = State.successRate[2] + 1
-                            State.successRate[3] = State.successRate[3] + 1
-                            logStage(5, "AUTO-TUNE", string.format("Outcome: SUCCESS (Ball deflected!) | Adjust TTI -> %.3fs", State.targetTTI))
-                        end
-                    end
-                end
-            end
-            State.checkBall = nil
-        end
+    -- Dynamic Aura Radius with Ping & Velocity Lead Time Compensation:
+    -- Higher speed & higher ping -> expand trigger radius significantly early!
+    local baseAuraRadius = Config.MinAuraRadius or 18
+    local pingLeadFactor = (State.ping / 1000) + 0.35 -- seconds of lead time
+    local speedAddition = Resolver.spd * pingLeadFactor
+    State.auraRadius = math.clamp(baseAuraRadius + speedAddition, baseAuraRadius, 150)
 
-        ------------------------------------------------------------------------
-        -- STAGE 1: SCAN & FIND REAL BALL
-        ------------------------------------------------------------------------
-        if not ballContainer or not ballContainer.Parent or now - lastScan > 0.5 then
-            ballContainer = findBalls()
-            lastScan = now
-        end
-        local bc = ballContainer
+    -- Dynamic TTI Threshold for Early Parry
+    -- Trigger parry when TTI is less than network ping + reaction window (e.g. ~0.22s - 0.40s)
+    local targetTTIThreshold = math.clamp((State.ping / 1000) + 0.22, 0.15, 0.45)
 
-        local ballObj = nil
-        if bc then
-            for _, c in ipairs(bc:GetChildren()) do
-                if isReal(c) then ballObj = c; break end
-            end
-        end
-        if not ballObj then
-            for _, c in ipairs(Workspace:GetChildren()) do
-                if isReal(c) then ballObj = c; break end
-            end
-        end
-
-        State.ball = ballObj
-        if not ballObj or not ballObj.Parent or not isReal(ballObj) then
-            State.vel = Vector3.new(); State.spd = 0; State.chasing = false
-            State.traj = {}; State.parryCount = 0; State.auraRadius = 10
-            if (Config.LogBallTarget or Config.DebugConsole) and State.lastChasingState ~= nil and State.lastChasingState ~= false then
-                State.lastChasingState = false
-                print("[BALL TARGET] ⚪ Ball inactive / not found")
-            end
-            return
-        end
-
-        State.pos = bpos(ballObj)
-        State.vel = bvel(ballObj)
-        State.spd = mag(State.vel)
-
-        local tgtName, isTgtMe = resolveTarget(ballObj)
-        State.tgt = tgtName
-        State.chasing = isTgtMe
-
-        -- Server Parry Verification from Player Attributes
-        local aliveP = getAlivePlayer()
-        if aliveP then
-            local spc = attr(aliveP, "ServerParryCount")
-            if type(spc) == "number" and spc > (State.serverParryCount or 0) then
-                State.serverParryCount = spc
-                logStage(5, "SERVER PARRY CONFIRMED", string.format("ServerParryCount updated to %d!", spc))
-            end
-            local isP = attr(aliveP, "Parrying")
-            if isP ~= nil then
-                State.isParrying = (isP == true)
-            end
-        end
-
-        ------------------------------------------------------------------------
-        -- STAGE 2: METRICS & TRAJECTORY COMPUTATION
-        ------------------------------------------------------------------------
-        if not State.traj[ballObj] then
-            State.traj[ballObj] = { samples = {}, isCurve = false, lastDot = 1 }
-        end
-        local td = State.traj[ballObj]
-        table.insert(td.samples, { vel = State.vel })
-        if #td.samples > 25 then table.remove(td.samples, 1) end
-
-        -- Curve Angle Detection
-        if #td.samples >= 3 then
-            local angleSum = 0
-            for i = 2, #td.samples do
-                local pv = td.samples[i-1].vel; local cv = td.samples[i].vel
-                local pm2 = mag(pv); local cm2 = mag(cv)
-                if pm2 > 0 and cm2 > 0 then
-                    local dval = math.max(-1, math.min(1, dot(norm(pv), norm(cv))))
-                    local ang = math.deg(math.acos(dval))
-                    if ang > 4 then angleSum = angleSum + ang/4 end
-                end
-            end
-            td.isCurve = angleSum > 6
-        end
-        State.isCurving = td.isCurve
-
-        local chr = getLocalCharacter()
-        local hrp = chr and (chr:FindFirstChild("HumanoidRootPart") or chr.PrimaryPart)
-        local hrpPos = hrp and hrp.Position or (State.pos + Vector3.new(0,0,10))
-
-        local d = dist(State.pos, hrpPos)
-        local tti = State.spd > 0.5 and (d / State.spd) or 99
-
-        -- Dynamic White Aura Radius calculation: higher ball speed = larger white aura circle
-        local baseAuraRadius = 8
-        local speedFactor = State.spd * (State.targetTTI + (State.ping / 800))
-        local auraRadius = math.clamp(baseAuraRadius + speedFactor, 8, 60)
-        if td.isCurve then auraRadius = auraRadius * 1.15 end
-        State.auraRadius = auraRadius
-
-        local dirToPlayer = norm(hrpPos - State.pos)
-        local velDir = norm(State.vel)
-        local dotProd = dot(velDir, dirToPlayer)
-        local toward = dotProd > 0
-        local perpDist = d * math.sqrt(math.max(0, 1 - dotProd^2))
-
-        ------------------------------------------------------------------------
-        -- BALL TARGET & DIRECTION CONSOLE LOGGER
-        ------------------------------------------------------------------------
-        local isFlyingAtPlayer = false
-        if State.spd > 1 and hrp then
-            if State.chasing then
-                -- Explicit target: ball is designated for LocalPlayer and moving generally towards player or close
-                isFlyingAtPlayer = (dotProd > 0.15 or d < 20)
+    -- Console Logger for Target Threat Status
+    if Config.DebugConsole then
+        if isThreat ~= State.lastThreatState then
+            State.lastThreatState = isThreat
+            if isThreat then
+                print(string.format("[AutoParry] 🎯 BALL IS FLYING AT YOU! Speed: %.1f studs/s | Dist: %.1f studs | TTI: %.2fs | Dot: %.2f | PerpDist: %.1f studs", Resolver.spd, distToPlayer, tti, dotProd, perpDist))
             else
-                -- Not explicit target: ball vector must be flying directly at LocalPlayer
-                isFlyingAtPlayer = ((dotProd > 0.90 and perpDist < 12) or (d < 12 and dotProd > 0.5)) and State.spd > 5
+                print(string.format("[AutoParry] 🟢 Ball vector safe / turned away | Speed: %.1f studs/s | Dist: %.1f studs | Dot: %.2f", Resolver.spd, distToPlayer, dotProd))
             end
         end
+    end
 
-        if Config.LogBallTarget or Config.DebugConsole then
-            if State.lastChasingState ~= isFlyingAtPlayer or State.tgt ~= State.lastTgt then
-                State.lastChasingState = isFlyingAtPlayer
-                State.lastTgt = State.tgt
-                if isFlyingAtPlayer then
-                    print(string.format("[BALL TARGET] 🎯 BALL IS FLYING AT YOU! | Target: %s | Speed: %.1f studs/s | Distance: %.1f studs | TTI: %.2fs | PerpDist: %.1f studs", State.tgt ~= "" and State.tgt or (lp and lp.Name or "You"), State.spd, d, tti, perpDist))
-                elseif State.chasing then
-                    print(string.format("[BALL TARGET] ⚠️ You are target, but vector angled away | Target: %s | Speed: %.1f studs/s | Distance: %.1f studs | Dot: %.2f", State.tgt ~= "" and State.tgt or (lp and lp.Name or "You"), State.spd, d, dotProd))
-                elseif State.tgt ~= "" then
-                    print(string.format("[BALL TARGET] 🟢 Ball flying at another player | Current Target: %s | Speed: %.1f studs/s | Distance to you: %.1f studs", State.tgt, State.spd, d))
-                else
-                    print(string.format("[BALL TARGET] ⚪ Ball moving, no target | Speed: %.1f studs/s | Distance to you: %.1f studs", State.spd, d))
-                end
-            end
+    -- Check Parry Condition:
+    -- 1. Threat is confirmed via strict direction scan (dot > 0.88, perpDist < 6.5)
+    -- 2. AND (Distance is inside auraRadius OR TTI <= targetTTIThreshold)
+    -- 3. AND Cooldown > 0.25s since last parry
+    local timeSinceLastParry = now - State.lastParryTime
+    local insideAura = (distToPlayer <= State.auraRadius) or (tti <= targetTTIThreshold)
+    local shouldParry = Config.AutoParry and isThreat and insideAura and timeSinceLastParry > 0.25
+
+    if shouldParry then
+        State.lastParryTime = now
+        State.parryCount = State.parryCount + 1
+
+        if Config.DebugConsole then
+            print(string.format("[AutoParry] ⚡ PARRY EXECUTED (#%d)! Mode: %s | Dist: %.1f <= Aura: %.1f studs | Speed: %.1f studs/s | TTI: %.2fs (Thresh: %.2fs)", State.parryCount, Config.ParryMode, distToPlayer, State.auraRadius, Resolver.spd, tti, targetTTIThreshold))
         end
 
-        ------------------------------------------------------------------------
-        -- STAGE 3: PARRY & CLASH DECISION CHECK (WHITE AURA SYSTEM)
-        ------------------------------------------------------------------------
-        local alreadyParried = State.parriedBall == ballObj and (now - State.parryTime) < 0.5
-        local insideAura = d <= State.auraRadius
+        doParry()
 
-        local shouldParry = Config.AutoParry and chr and State.spd >= 5 and not alreadyParried and isFlyingAtPlayer and insideAura
-        if shouldParry then
-            if hrp then
-                logStage(3, "DECISION -> WHITE AURA PARRY TRIGGERED!", string.format("Dist: %.1f <= AuraRadius: %.1f | Speed: %.1f | TTI: %.2fs | Ping: %dms | Dot: %.2f", d, State.auraRadius, State.spd, tti, State.ping, dotProd))
-
-                doParry()
-
-                State.parriedBall = ballObj
-                State.parryTime = now
-                State.parriedAt = tti
-                State.parryCount = State.parryCount + 1
-                State.checkBall = ballObj
-                State.checkTime = now + 0.25
-
-                if Config.AutoAbility and (now - State.lastAb > 1.2) then
-                    doAbility()
-                    State.lastAb = now
-                end
-            end
+        if Config.AutoAbility and (now - State.lastAbilityTime > 1.2) then
+            State.lastAbilityTime = now
+            doAbility()
         end
-
-        -- Auto Clash Logic
-        if Config.AutoClash and chr and State.spd >= Config.ClashMinSpeed and not (State.parriedBall == ballObj and (now - State.parryTime) < 0.15) then
-            if hrp and toward and d > 0 and d <= Config.ClashRange then
-                logStage(3, "DECISION -> CLASH PARRY!", string.format("Clash Range: %.1f | Speed: %.1f", d, State.spd))
-
-                doParry()
-
-                State.parriedBall = ballObj
-                State.parryTime = now
-                State.parryCount = State.parryCount + 1
-                State.checkBall = ballObj
-                State.checkTime = now + 0.25
-            end
-        end
-
-        State.prevVel = State.vel
-    end)
-    if not ok then
-        local m = tostring(err):sub(1, 80)
-        table.insert(State.errs, 1, m)
-        if #State.errs > 5 then table.remove(State.errs) end
     end
 end)
 
 --------------------------------------------------------------------------------
--- Rendering & On-Screen Debug HUD (Drawing API)
+-- 3D Rendering (Drawing API: White Aura Circle & Trajectory Line)
 --------------------------------------------------------------------------------
 task.spawn(function()
     local have_draw = type(Drawing) == "table"
     if not have_draw then return end
 
-    local ogLines, dotObj, ringLines = {}, {}, {}
-    for i = 1, 24 do
+    local SEGMENTS = 24
+    local circleOffsets = {}
+    for i = 1, SEGMENTS do
+        local angle = (i - 1) / SEGMENTS * math.pi * 2
+        circleOffsets[i] = { cos = math.cos(angle), sin = math.sin(angle) }
+    end
+
+    local ringLines = {}
+    for i = 1, SEGMENTS do
         local l = Drawing.new("Line")
         if l then l.Visible = false; l.Thickness = 2; l.Transparency = 1 end
         ringLines[i] = l
     end
 
-    local cursorTxt = Drawing.new("Text")
-    if cursorTxt then cursorTxt.Font = Drawing.Fonts.UI; cursorTxt.Size = 14; cursorTxt.Outline = true; cursorTxt.Center = true; cursorTxt.Visible = false end
-
-    for i = 1, 36 do
-        local t = Drawing.new("Text")
-        if t then t.Font = Drawing.Fonts.UI; t.Size = 12; t.Outline = true; t.Visible = false end
-        ogLines[i] = t
-    end
-
-    local bg = Drawing.new("Square"); local bdr = Drawing.new("Square")
-    if bg then bg.Thickness = 0; bg.Visible = false end
-    if bdr then bdr.Filled = false; bdr.Thickness = 1; bdr.Color = Color3.fromRGB(60,60,60); bdr.Visible = false end
-
-    local dbgDrag = { active = false, offX = 0, offY = 0, posX = 15, posY = 15 }
-    local prevClick = false
+    local dotObj = {}
 
     while true do
-        task.wait(0.03)
-        local ok, err = pcall(function()
-            local mx, my
-            pcall(function() mx = mouse.X; my = mouse.Y end)
-            local _, clicked = pcall(ismouse1pressed)
-
-            -- Handle Dragging Telemetry HUD
-            if clicked and not prevClick and mx and my then
-                if bg and bg.Visible and mx >= dbgDrag.posX and mx <= dbgDrag.posX + 380 and my >= dbgDrag.posY and my <= dbgDrag.posY + 20 then
-                    dbgDrag.active = true
-                    dbgDrag.offX = mx - dbgDrag.posX
-                    dbgDrag.offY = my - dbgDrag.posY
-                end
-            end
-            if dbgDrag.active and clicked and mx and my then
-                dbgDrag.posX = mx - dbgDrag.offX
-                dbgDrag.posY = my - dbgDrag.offY
-            end
-            if not clicked then dbgDrag.active = false end
-            prevClick = clicked
-
-            local dOn = Config.DebugOverlay or Config.BallDebug
-            if bg then bg.Visible = dOn end
-            if bdr then bdr.Visible = dOn end
-            for i = 1, 36 do if ogLines[i] then ogLines[i].Visible = false end end
-
-            if dOn then
-                local hudH = Config.BallDebug and 480 or 340
-                if bg then bg.Color = Color3.fromRGB(10,10,10); bg.Transparency = 0.15; bg.Size = Vector2.new(380, hudH); bg.Position = Vector2.new(dbgDrag.posX, dbgDrag.posY) end
-                if bdr then bdr.Position = Vector2.new(dbgDrag.posX, dbgDrag.posY); bdr.Size = Vector2.new(380, hudH) end
-
+        task.wait(0.016) -- ~60 FPS update rate for 3D Ring
+        pcall(function()
+            -- Render White Aura Circle (3D Ring)
+            if Config.RangeRing then
                 local chr = getLocalCharacter()
                 local hrp = chr and (chr:FindFirstChild("HumanoidRootPart") or chr.PrimaryPart)
-                local d = hrp and State.ball and dist(State.pos, hrp.Position) or 0
-                local pdist = State.spd > 0.5 and math.clamp(State.spd * (State.targetTTI + (State.ping / 800)) + 2 * (State.isCurving and 1.1 or 1.0), 6, 32) or 0
-                local tti = State.spd > 0.5 and d / State.spd or 0
-                local sr = State.successRate[3] > 0 and math.floor(State.successRate[2]/State.successRate[3]*100) or 0
-
-                local lines = {
-                    "=== Blade Ball Auto Parry (" .. tostring(Config.ParryMode) .. ") ===", "",
-                    "Ball Detected:", tostring(State.ball ~= nil),
-                    "Speed:", math.floor(State.spd) .. " studs/s",
-                    "Target:", State.tgt, "Chasing You:", tostring(State.chasing),
-                    "Ping:", State.ping .. " ms",
-                    "Distance:", string.format("%.1f studs", d),
-                    "Time-To-Impact:", string.format("%.2fs", tti),
-                    "Target TTI:", string.format("%.3fs", State.targetTTI),
-                    "Aura Radius:", string.format("%.1f studs", State.auraRadius or 10),
-                    "Curving Ball:", tostring(State.isCurving),
-                    "Parries Executed:", State.parryCount,
-                    "Server Parry Count:", State.serverParryCount or 0,
-                    "Success Rate:", sr .. "%",
-                    "Dedup Cooldown:", (State.parriedBall == State.ball and (tick() - State.parryTime < 0.5)) and "ACTIVE" or "READY",
-                    "Clash Mode:", Config.AutoClash and "ON" or "OFF",
-                    "Last Status:", #State.errs > 0 and State.errs[1] or "OK",
-                }
-
-                if Config.BallDebug then
-                    table.insert(lines, "--- BALL & PLAYER DEBUG ---")
-                    table.insert(lines, "")
-                    table.insert(lines, "Player Path:")
-                    table.insert(lines, State.lastPlayerPath ~= "" and State.lastPlayerPath or "None")
-                    table.insert(lines, "Player Attrs:")
-                    table.insert(lines, State.lastPlayerAttrs ~= "" and State.lastPlayerAttrs:sub(1, 60) or "(None)")
-                    table.insert(lines, "Ball Path:")
-                    table.insert(lines, State.lastBallPath ~= "" and State.lastBallPath or "None")
-                    table.insert(lines, "Ball Attrs:")
-                    table.insert(lines, State.lastBallAttrs ~= "" and State.lastBallAttrs:sub(1, 60) or "(None)")
-                end
-
-                for i = 1, #lines, 2 do
-                    local t = ogLines[(i+1)//2]
-                    if t then
-                        t.Visible = true
-                        t.Text = lines[i] .. " " .. tostring(lines[i+1] or "")
-                        t.Position = Vector2.new(dbgDrag.posX + 8, dbgDrag.posY + 6 + ((i-1)//2)*18)
-                        t.Color = i == 1 and Color3.fromRGB(122,134,255)
-                            or (tostring(lines[i]):sub(1,3) == "---" and Color3.fromRGB(255,189,122) or Color3.fromRGB(200,230,255))
-                    end
-                end
-            end
-
-            -- 3D White Aura Circle Rendering (matching cathook.lua renderer)
-            for i = 1, 24 do if ringLines[i] then ringLines[i].Visible = false end end
-
-            local chr = getLocalCharacter()
-            if Config.RangeRing and chr then
-                local hrp = chr:FindFirstChild("HumanoidRootPart") or chr.PrimaryPart
                 if hrp then
-                    local currentAuraRadius = State.auraRadius or 10
-                    if currentAuraRadius > 2 then
-                        local ppos = hrp.Position; local seg = 24
-                        local py = ppos.Y - 3
-                        local screenPoints = {}
+                    local currentAuraRadius = State.auraRadius or 18
+                    local ppos = hrp.Position
+                    local py = ppos.Y - 3
+                    local screenPoints = {}
 
-                        for i = 1, seg do
-                            local a = (i-1)/seg*math.pi*2
-                            local p = Vector3.new(ppos.X + math.cos(a)*currentAuraRadius, py, ppos.Z + math.sin(a)*currentAuraRadius)
-                            local sv, on = CustomW2S(p)
-                            screenPoints[i] = { pos = sv, visible = on }
-                        end
+                    for i = 1, SEGMENTS do
+                        local off = circleOffsets[i]
+                        local p = Vector3.new(ppos.X + off.cos * currentAuraRadius, py, ppos.Z + off.sin * currentAuraRadius)
+                        local sv, on = CustomW2S(p)
+                        screenPoints[i] = { pos = sv, visible = on }
+                    end
 
-                        for i = 1, seg do
-                            local nxt = (i % seg) + 1
-                            local p1 = screenPoints[i]
-                            local p2 = screenPoints[nxt]
-                            local line = ringLines[i]
+                    for i = 1, SEGMENTS do
+                        local nxt = (i % SEGMENTS) + 1
+                        local p1 = screenPoints[i]
+                        local p2 = screenPoints[nxt]
+                        local line = ringLines[i]
 
-                            if line and p1.visible and p2.visible then
-                                line.From = p1.pos
-                                line.To = p2.pos
-                                line.Color = Color3.fromRGB(255, 255, 255)
-                                line.Thickness = 2
-                                line.Transparency = 1
-                                line.Visible = true
-                            elseif line then
-                                line.Visible = false
-                            end
+                        if line and p1.visible and p2.visible then
+                            line.From = p1.pos
+                            line.To = p2.pos
+                            line.Color = Color3.fromRGB(255, 255, 255)
+                            line.Thickness = 2
+                            line.Transparency = 1
+                            line.Visible = true
+                        elseif line then
+                            line.Visible = false
                         end
                     end
+                else
+                    for i = 1, SEGMENTS do if ringLines[i] then ringLines[i].Visible = false end end
                 end
+            else
+                for i = 1, SEGMENTS do if ringLines[i] then ringLines[i].Visible = false end end
             end
 
-            -- Ball Trajectory Line Rendering
+            -- Render Resolved Trajectory Line
             for _, l in pairs(dotObj) do if l then l.Visible = false end end
-            if Config.Trajectory and State.ball and State.spd > 0.5 then
+            if Config.Trajectory and Resolver.spd > 1 and Resolver.resolvedPos ~= Vector3.new() then
                 local prev
+                local velDir = Resolver.resolvedVel.Unit
                 for i = 0, 5 do
-                    local p = State.pos + norm(State.vel) * State.spd * (i * 0.35)
-                    local okW, sv, on = pcall(WorldToScreen, p)
-                    if okW and on then
+                    local p = Resolver.resolvedPos + velDir * Resolver.spd * (i * 0.35)
+                    local sv, on = CustomW2S(p)
+                    if on then
                         if prev then
                             if not dotObj[i] then dotObj[i] = Drawing.new("Line") end
                             if dotObj[i] then
                                 dotObj[i].Visible = true
-                                dotObj[i].From = prev; dotObj[i].To = sv
+                                dotObj[i].From = prev
+                                dotObj[i].To = sv
                                 dotObj[i].Color = Color3.fromRGB(255, 255, 0)
                                 dotObj[i].Thickness = 3
-                                dotObj[i].Transparency = 0
+                                dotObj[i].Transparency = 1
                             end
                         end
                         prev = sv
@@ -1137,4 +503,72 @@ task.spawn(function()
     end
 end)
 
-print("=== Blade Ball Auto Parry (INS-ui + Stage Debug) Loaded ===")
+--------------------------------------------------------------------------------
+-- UI Menu Construction
+--------------------------------------------------------------------------------
+if Lib and Lib.CreateWindow then
+    local Window = Lib:CreateWindow({
+        title = "Blade Ball - AntiCheat Resolver",
+        subtitle = "Matcha AP",
+        size = Vector2.new(600, 440),
+        menuKey = "p",
+        configName = "bladeball_resolver",
+        configFolder = "bladeball",
+        accentA = Color3.fromRGB(122, 134, 255),
+        accentB = Color3.fromRGB(189, 130, 255),
+        startOpen = true,
+        keybindOverlay = false,
+        checkboxStyle = true,
+        smartFps = true,
+        autoSave = true,
+    })
+
+    local Main = Window:Tab("Auto Parry", "swords")
+    local VisTab = Window:Tab("Visuals & Debug", "eye")
+
+    local ParrySection = Main:Section("Parry Core", "Left", "Automatic deflection via direction scanning")
+    local SettingsSection = Main:Section("Settings", "Right", "Parry behavior & abilities")
+
+    ParrySection:Toggle("Auto Parry", Config.AutoParry, function(v)
+        Config.AutoParry = v
+        if v then
+            print("[AutoParry] Auto Parry Activated")
+        else
+            print("[AutoParry] Auto Parry Deactivated")
+        end
+    end)
+
+    ParrySection:Dropdown("Parry Input Mode", {"F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse + Remote)"}, Config.ParryMode, function(v)
+        Config.ParryMode = v
+    end)
+
+    ParrySection:Slider("Min Aura Radius", 10, 40, Config.MinAuraRadius, function(v)
+        Config.MinAuraRadius = v
+    end)
+
+    SettingsSection:Toggle("Auto Ability", Config.AutoAbility, function(v)
+        Config.AutoAbility = v
+    end)
+
+    local RenderSection = VisTab:Section("Render Settings", "Left", "3D distance ring & trajectory line")
+    local DebugSection = VisTab:Section("Console Logging", "Right", "Developer console logs (F9)")
+
+    RenderSection:Toggle("White Aura Circle (3D Ring)", Config.RangeRing, function(v)
+        Config.RangeRing = v
+    end)
+
+    RenderSection:Toggle("Ball Flight Trajectory", Config.Trajectory, function(v)
+        Config.Trajectory = v
+    end)
+
+    DebugSection:Toggle("Console Logs (F9 Output)", Config.DebugConsole, function(v)
+        Config.DebugConsole = v
+    end)
+
+    DebugSection:Button("Reset Ball Resolver", function()
+        Resolver:Reset()
+        print("[AutoParry] Ball Resolver State Reset")
+    end)
+end
+
+print("=== Blade Ball Auto Parry (Optimized Latency & Strict Direction) Loaded ===")
