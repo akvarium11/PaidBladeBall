@@ -1,11 +1,53 @@
+--------------------------------------------------------------------------------
+-- UI Library Loader (CatHook Method: Local Workspace + Remote GitHub Fallback)
+--------------------------------------------------------------------------------
 local Lib
-local success, result = pcall(function()
-    return loadstring(game:HttpGet("https://raw.githubusercontent.com/akvarium11/PaidBladeBall/refs/heads/master/BladeBall/uilib.lua"))()
-end)
-if success and result then
-    Lib = result
-else
-    Lib = rawget(_G, "INSui") or INSui
+do
+    local function fetchUI()
+        -- 1. Try local workspace paths first
+        if type(readfile) == "function" then
+            local paths = {"BladeBall/uilib.lua", "workspace/BladeBall/uilib.lua", "uilib.lua", "workspace/uilib.lua"}
+            for _, path in ipairs(paths) do
+                local ok, content = pcall(readfile, path)
+                if ok and content and type(content) == "string" and #content > 0 then
+                    local func = loadstring(content)
+                    if func then
+                        local res = func()
+                        local lib = res or (typeof(getgenv) == "function" and (getgenv().INSui or getgenv().INSuiUI)) or _G.INSui or _G.INSuiUI or shared.INSui
+                        if lib then return lib end
+                    end
+                end
+            end
+        end
+
+        -- 2. Try HTTP download from GitHub
+        local targetUrl = "https://raw.githubusercontent.com/akvarium11/PaidBladeBall/refs/heads/master/BladeBall/uilib.lua"
+        local httpSuccess, httpContent = pcall(function()
+            if typeof(httpget) == "function" then
+                return httpget(targetUrl)
+            elseif game and type(game.HttpGet) == "function" then
+                return game:HttpGet(targetUrl)
+            end
+        end)
+
+        if httpSuccess and httpContent and type(httpContent) == "string" and #httpContent > 0 then
+            local func, compileErr = loadstring(httpContent)
+            if func then
+                local res = func()
+                local lib = res or (typeof(getgenv) == "function" and (getgenv().INSui or getgenv().INSuiUI)) or _G.INSui or _G.INSuiUI or shared.INSui
+                if lib then return lib end
+            else
+                warn("[AutoParry] Failed to compile online UI Library: " .. tostring(compileErr))
+            end
+        else
+            warn("[AutoParry] Failed to download UI Library from GitHub: " .. tostring(httpContent))
+        end
+
+        -- 3. Fallback to existing global INSui if available
+        return (typeof(getgenv) == "function" and (getgenv().INSui or getgenv().INSuiUI)) or _G.INSui or _G.INSuiUI or shared.INSui
+    end
+
+    Lib = fetchUI()
 end
 
 -- Services
@@ -717,6 +759,8 @@ if Lib and Lib.CreateWindow then
         Resolver:Reset()
         print("[AutoParry] Ball Resolver State Reset")
     end)
+else
+    warn("[AutoParry] Could not initialize UI Library (Lib is nil). UI Menu skipped.")
 end
 
 print("=== Blade Ball Auto Parry (Target Verification + Anti-False Positive Engine) Loaded ===")
