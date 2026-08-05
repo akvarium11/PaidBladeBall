@@ -85,6 +85,7 @@ local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StatsService = game:GetService("Stats")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local UserInputService = game:GetService("UserInputService")
 
 local lp = Players.LocalPlayer
 
@@ -93,6 +94,7 @@ local lp = Players.LocalPlayer
 --------------------------------------------------------------------------------
 local Config = {
     AutoParry = false,
+    AutoParryKey = "X", -- Default keybind to toggle Auto Parry (e.g. "X")
     ParryMode = "F Key", -- "F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse)"
     TargetCheck = true,  -- Strict target check (prevents false positives when ball flies near you to another player)
     MinAuraRadius = 15,  -- Base aura circle radius (studs)
@@ -601,6 +603,23 @@ RunService.Heartbeat:Connect(function()
 end)
 
 --------------------------------------------------------------------------------
+-- Fallback Keybind Handler (When UI Library is not active)
+--------------------------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if not Lib and input.UserInputType == Enum.UserInputType.Keyboard then
+        if input.KeyCode == Enum.KeyCode[Config.AutoParryKey] then
+            Config.AutoParry = not Config.AutoParry
+            if Config.AutoParry then
+                print("[AutoParry] Auto Parry Activated (via Keybind)")
+            else
+                print("[AutoParry] Auto Parry Deactivated (via Keybind)")
+            end
+        end
+    end
+end)
+
+--------------------------------------------------------------------------------
 -- 3D Rendering (Drawing API: Dynamic Aura Ring & Trajectory Line)
 --------------------------------------------------------------------------------
 task.spawn(function()
@@ -732,7 +751,7 @@ if Lib and Lib.CreateWindow then
         else
             print("[AutoParry] Auto Parry Deactivated")
         end
-    end)
+    end):AddKeybind(Config.AutoParryKey, "Toggle")
 
     ParrySection:Toggle("Target Verification", Config.TargetCheck, function(v)
         Config.TargetCheck = v
