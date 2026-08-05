@@ -782,14 +782,22 @@ if Lib and Lib.CreateWindow then
         accentA = Color3.fromRGB(122, 134, 255),
         accentB = Color3.fromRGB(189, 130, 255),
         startOpen = true,
-        keybindOverlay = Config.KeybindHUD,
+        keybindOverlay = true,
         checkboxStyle = true,
         smartFps = true,
         autoSave = true,
     })
 
+    if Window.SetKeybindOverlay then
+        Window:SetKeybindOverlay(Config.KeybindHUD ~= false)
+    end
+
     local Main = Window:Tab("Auto Parry", "swords")
     local VisTab = Window:Tab("Visuals & Debug", "eye")
+
+    if Window.AddSettingsTab then
+        Window:AddSettingsTab()
+    end
 
     local ParrySection = Main:Section("Parry Core", "Left", "Automatic deflection via direction scanning")
     local ClashSection = Main:Section("Clash Mode", "Right", "High-speed close proximity block spam")
@@ -823,7 +831,7 @@ if Lib and Lib.CreateWindow then
     ClashSection:Toggle("Auto Clash Mode", Config.AutoClash, function(v)
         Config.AutoClash = v
         print("[AutoParry] Auto Clash Mode set to: " .. tostring(v))
-    end)
+    end):AddKeybind("C", "Toggle")
 
     ClashSection:Slider("Clash Distance", 10, 40, Config.ClashDistance, function(v)
         Config.ClashDistance = v
@@ -835,7 +843,7 @@ if Lib and Lib.CreateWindow then
 
     ClashSection:Toggle("Auto Ability", Config.AutoAbility, function(v)
         Config.AutoAbility = v
-    end)
+    end):AddKeybind("V", "Toggle")
 
     local RenderSection = VisTab:Section("Render Settings", "Left", "3D distance ring & trajectory line")
     local DebugSection = VisTab:Section("Console Logging", "Right", "Developer console logs (F9)")
