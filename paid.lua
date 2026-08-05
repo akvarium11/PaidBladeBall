@@ -3,6 +3,28 @@
 --------------------------------------------------------------------------------
 local Lib
 do
+    local function resolveLib(res)
+        if res and type(res) == "table" and res.CreateWindow then
+            return res
+        end
+        if type(getgenv) == "function" then
+            local ok, g = pcall(getgenv)
+            if ok and type(g) == "table" then
+                if g.INSui and type(g.INSui) == "table" and g.INSui.CreateWindow then return g.INSui end
+                if g.INSuiUI and type(g.INSuiUI) == "table" and g.INSuiUI.CreateWindow then return g.INSuiUI end
+            end
+        end
+        if type(_G) == "table" then
+            if _G.INSui and type(_G.INSui) == "table" and _G.INSui.CreateWindow then return _G.INSui end
+            if _G.INSuiUI and type(_G.INSuiUI) == "table" and _G.INSuiUI.CreateWindow then return _G.INSuiUI end
+        end
+        if type(shared) == "table" then
+            if shared.INSui and type(shared.INSui) == "table" and shared.INSui.CreateWindow then return shared.INSui end
+            if shared.INSuiUI and type(shared.INSuiUI) == "table" and shared.INSuiUI.CreateWindow then return shared.INSuiUI end
+        end
+        return nil
+    end
+
     local function fetchUI()
         -- 1. Try local workspace paths first
         if type(readfile) == "function" then
@@ -10,11 +32,13 @@ do
             for _, path in ipairs(paths) do
                 local ok, content = pcall(readfile, path)
                 if ok and content and type(content) == "string" and #content > 0 then
-                    local func = loadstring(content)
+                    local func, err = loadstring(content)
                     if func then
-                        local res = func()
-                        local lib = res or (typeof(getgenv) == "function" and (getgenv().INSui or getgenv().INSuiUI)) or _G.INSui or _G.INSuiUI or shared.INSui
-                        if lib then return lib end
+                        local okExec, res = pcall(func)
+                        if okExec then
+                            local lib = resolveLib(res)
+                            if lib then return lib end
+                        end
                     end
                 end
             end
@@ -23,7 +47,7 @@ do
         -- 2. Try HTTP download from GitHub
         local targetUrl = "https://raw.githubusercontent.com/akvarium11/PaidBladeBall/refs/heads/master/BladeBall/uilib.lua"
         local httpSuccess, httpContent = pcall(function()
-            if typeof(httpget) == "function" then
+            if type(httpget) == "function" then
                 return httpget(targetUrl)
             elseif game and type(game.HttpGet) == "function" then
                 return game:HttpGet(targetUrl)
@@ -33,9 +57,13 @@ do
         if httpSuccess and httpContent and type(httpContent) == "string" and #httpContent > 0 then
             local func, compileErr = loadstring(httpContent)
             if func then
-                local res = func()
-                local lib = res or (typeof(getgenv) == "function" and (getgenv().INSui or getgenv().INSuiUI)) or _G.INSui or _G.INSuiUI or shared.INSui
-                if lib then return lib end
+                local okExec, res = pcall(func)
+                if okExec then
+                    local lib = resolveLib(res)
+                    if lib then return lib end
+                else
+                    warn("[AutoParry] Failed to execute online UI Library: " .. tostring(res))
+                end
             else
                 warn("[AutoParry] Failed to compile online UI Library: " .. tostring(compileErr))
             end
@@ -44,7 +72,7 @@ do
         end
 
         -- 3. Fallback to existing global INSui if available
-        return (typeof(getgenv) == "function" and (getgenv().INSui or getgenv().INSuiUI)) or _G.INSui or _G.INSuiUI or shared.INSui
+        return resolveLib(nil)
     end
 
     Lib = fetchUI()
