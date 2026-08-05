@@ -20,6 +20,9 @@ local Config = {
     AutoParry = false,
     ParryMode = "F Key", -- "F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse)"
     MinAuraRadius = 18,  -- Minimum aura circle radius (studs)
+    AutoClash = true,    -- Automatic Clash Mode (Block spam when close)
+    ClashDistance = 22,  -- Distance threshold for Clash Mode (studs)
+    ClashMinSpeed = 35,  -- Min ball speed for Clash Mode (studs/s)
     AutoAbility = false,
     DebugConsole = true, -- Logs target threat & parry triggers to F9 developer console
     RangeRing = true,    -- Draws 3D floor ring for parry distance
@@ -36,6 +39,8 @@ local State = {
     ping = 60,
     prevRawPos = Vector3.new(),
     rawVel = Vector3.new(),
+    inClash = false,
+    lastClashSpam = 0,
 }
 
 --------------------------------------------------------------------------------
@@ -104,6 +109,7 @@ function Resolver:Reset()
     self.validCount = 0
     State.prevRawPos = Vector3.new()
     State.rawVel = Vector3.new()
+    State.inClash = false
 end
 
 function Resolver:Update(part, dt)
@@ -143,7 +149,6 @@ function Resolver:Update(part, dt)
     -- Reject Anti-Cheat Teleport Jumps (Extreme Speeds > 550 studs/s)
     if instantSpeed > MAX_PHYSICAL_SPEED then
         self.outlierCount = self.outlierCount + 1
-        -- Advance predicted position along last valid physical trajectory
         self.resolvedPos = self.resolvedPos + self.resolvedVel * dt
         self.spd = self.resolvedVel.Magnitude
         return false
@@ -203,8 +208,7 @@ local function scanBallDirection()
 
     local distToPlayer = (hrp.Position - ballPos).Magnitude
 
-    -- Require ball speed to be within valid physical range (5 - 550 studs/s)
-    if ballSpeed < 6 or ballSpeed > MAX_PHYSICAL_SPEED then
+    if ballSpeed < 5 or ballSpeed > MAX_PHYSICAL_SPEED then
         return false, 0, distToPlayer, 999, 999
     end
 
@@ -227,6 +231,26 @@ local function scanBallDirection()
 end
 
 --------------------------------------------------------------------------------
+-- Enemy Proximity Scan (For Clash Detection)
+--------------------------------------------------------------------------------
+local function isEnemyNear(myHrp, range)
+    local aliveFolder = Workspace:FindFirstChild("Alive")
+    if not aliveFolder or not myHrp then return false end
+    for _, char in ipairs(aliveFolder:GetChildren()) do
+        if char.Name ~= lp.Name then
+            local enemyHrp = char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart
+            if enemyHrp then
+                local dist = (enemyHrp.Position - myHrp.Position).Magnitude
+                if dist <= range then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+--------------------------------------------------------------------------------
 -- Physical Parry & Ability Action Execution (F Key, Mouse)
 --------------------------------------------------------------------------------
 local function pressFKey()
@@ -236,7 +260,7 @@ local function pressFKey()
         pcall(function()
             VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
             task.spawn(function()
-                task.wait(0.02)
+                task.wait(0.015)
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
             end)
         end)
@@ -248,7 +272,7 @@ local function pressFKey()
         pcall(function()
             keypress(0x46)
             task.spawn(function()
-                task.wait(0.02)
+                task.wait(0.015)
                 if type(keyrelease) == "function" then keyrelease(0x46) end
             end)
         end)
@@ -263,7 +287,7 @@ local function pressLMB()
             local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or Vector2.new(500, 500)
             VirtualInputManager:SendMouseButtonEvent(vp.X / 2, vp.Y / 2, 0, true, game, 1)
             task.spawn(function()
-                task.wait(0.02)
+                task.wait(0.015)
                 VirtualInputManager:SendMouseButtonEvent(vp.X / 2, vp.Y / 2, 0, false, game, 1)
             end)
         end)
@@ -275,7 +299,7 @@ local function pressLMB()
         pcall(function()
             mouse1press()
             task.spawn(function()
-                task.wait(0.02)
+                task.wait(0.015)
                 if type(mouse1release) == "function" then mouse1release() end
             end)
         end)
@@ -330,7 +354,7 @@ local function doAbility()
 end
 
 --------------------------------------------------------------------------------
--- Main Loop (Physical Speed Filtered Heartbeat)
+-- Main Loop (Includes Auto Parry & Clash Mode Spam Engine)
 --------------------------------------------------------------------------------
 local lastTime = tick()
 
@@ -354,17 +378,61 @@ RunService.Heartbeat:Connect(function()
     Resolver:Update(part, dt)
 
     local isThreat, dotProd, distToPlayer, tti, perpDist = scanBallDirection()
+    local chr = getLocalCharacter()
+    local hrp = chr and (chr:FindFirstChild("HumanoidRootPart") or chr.PrimaryPart)
 
-    -- Dynamic Aura Radius based strictly on REAL physical ball speed (capped at 550 studs/s)
+    ----------------------------------------------------------------------------
+    -- CLASH MODE DETECTION & BLOCK SPAMMING ENGINE
+    ----------------------------------------------------------------------------
+    local isClashActive = false
+    if Config.AutoParry and Config.AutoClash and hrp then
+        local clashDistLimit = Config.ClashDistance or 22
+        local clashMinSpd = Config.ClashMinSpeed or 35
+        local hasEnemyNear = isEnemyNear(hrp, clashDistLimit + 10)
+
+        -- Clash Condition:
+        -- 1. Ball is within Clash Distance (<= 22 studs) AND speed >= 35 studs/s
+        -- 2. AND (Ball is heading towards player OR enemy player is right next to local player)
+        if distToPlayer <= clashDistLimit and Resolver.spd >= clashMinSpd and (isThreat or dotProd > 0.20 or hasEnemyNear) then
+            isClashActive = true
+        end
+    end
+
+    if isClashActive then
+        if not State.inClash then
+            State.inClash = true
+            if Config.DebugConsole then
+                print(string.format("[AutoParry] ⚔️ CLASH MODE ACTIVATED! (Dist: %.1f studs | Speed: %.1f studs/s) - SPAMMING BLOCK!", distToPlayer, Resolver.spd))
+            end
+        end
+
+        -- Ultra-fast Clash Spamming (~40 Hz block spam)
+        if now - State.lastClashSpam > 0.025 then
+            State.lastClashSpam = now
+            State.lastParryTime = now
+            State.parryCount = State.parryCount + 1
+            doParry()
+        end
+        return -- Skip normal single-parry logic while in Clash Mode
+    else
+        if State.inClash then
+            State.inClash = false
+            if Config.DebugConsole then
+                print("[AutoParry] 🛡️ Clash Mode Deactivated")
+            end
+        end
+    end
+
+    ----------------------------------------------------------------------------
+    -- STANDARD SINGLE-PARRY DIRECTIONAL LOGIC
+    ----------------------------------------------------------------------------
     local baseAuraRadius = Config.MinAuraRadius or 18
-    local pingLeadFactor = (State.ping / 1000) + 0.25 -- seconds of lead time
+    local pingLeadFactor = (State.ping / 1000) + 0.25
     local speedAddition = Resolver.spd * pingLeadFactor
     State.auraRadius = math.clamp(baseAuraRadius + speedAddition, baseAuraRadius, 75)
 
-    -- Dynamic TTI Threshold for Early Parry
     local targetTTIThreshold = math.clamp((State.ping / 1000) + 0.20, 0.15, 0.40)
 
-    -- Console Logger for Target Threat Status
     if Config.DebugConsole then
         if isThreat ~= State.lastThreatState then
             State.lastThreatState = isThreat
@@ -376,10 +444,6 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- Parry Trigger Condition:
-    -- 1. Threat is confirmed (Dot > 0.88, PerpDist < 10.0, Speed <= 550)
-    -- 2. AND (distToPlayer <= auraRadius OR TTI <= targetTTIThreshold)
-    -- 3. AND Cooldown > 0.15s
     local timeSinceLastParry = now - State.lastParryTime
     local distanceTrigger = (distToPlayer <= State.auraRadius) or (tti <= targetTTIThreshold)
     local shouldParry = Config.AutoParry and isThreat and distanceTrigger and timeSinceLastParry > 0.15
@@ -402,7 +466,7 @@ RunService.Heartbeat:Connect(function()
 end)
 
 --------------------------------------------------------------------------------
--- 3D Rendering (Drawing API: White Aura Circle & Trajectory Line)
+-- 3D Rendering (Drawing API: Dynamic Aura Ring & Trajectory Line)
 --------------------------------------------------------------------------------
 task.spawn(function()
     local have_draw = type(Drawing) == "table"
@@ -427,12 +491,12 @@ task.spawn(function()
     while true do
         task.wait(0.016) -- ~60 FPS update rate for 3D Ring
         pcall(function()
-            -- Render White Aura Circle (3D Ring)
+            -- Render Aura Circle (3D Ring)
             if Config.RangeRing then
                 local chr = getLocalCharacter()
                 local hrp = chr and (chr:FindFirstChild("HumanoidRootPart") or chr.PrimaryPart)
                 if hrp then
-                    local currentAuraRadius = State.auraRadius or 18
+                    local currentAuraRadius = State.inClash and (Config.ClashDistance or 22) or (State.auraRadius or 18)
                     local ppos = hrp.Position
                     local py = ppos.Y - 3
                     local screenPoints = {}
@@ -444,6 +508,10 @@ task.spawn(function()
                         screenPoints[i] = { pos = sv, visible = on }
                     end
 
+                    -- Change ring color to Bright Red in Clash Mode, White in Normal Mode
+                    local ringColor = State.inClash and Color3.fromRGB(255, 50, 50) or Color3.fromRGB(255, 255, 255)
+                    local ringThickness = State.inClash and 3 or 2
+
                     for i = 1, SEGMENTS do
                         local nxt = (i % SEGMENTS) + 1
                         local p1 = screenPoints[i]
@@ -453,8 +521,8 @@ task.spawn(function()
                         if line and p1.visible and p2.visible then
                             line.From = p1.pos
                             line.To = p2.pos
-                            line.Color = Color3.fromRGB(255, 255, 255)
-                            line.Thickness = 2
+                            line.Color = ringColor
+                            line.Thickness = ringThickness
                             line.Transparency = 1
                             line.Visible = true
                         elseif line then
@@ -483,7 +551,7 @@ task.spawn(function()
                                 dotObj[i].Visible = true
                                 dotObj[i].From = prev
                                 dotObj[i].To = sv
-                                dotObj[i].Color = Color3.fromRGB(255, 255, 0)
+                                dotObj[i].Color = State.inClash and Color3.fromRGB(255, 50, 50) or Color3.fromRGB(255, 255, 0)
                                 dotObj[i].Thickness = 3
                                 dotObj[i].Transparency = 1
                             end
@@ -503,7 +571,7 @@ if Lib and Lib.CreateWindow then
     local Window = Lib:CreateWindow({
         title = "Blade Ball - AntiCheat Resolver",
         subtitle = "Matcha AP",
-        size = Vector2.new(600, 440),
+        size = Vector2.new(620, 480),
         menuKey = "p",
         configName = "bladeball_resolver",
         configFolder = "bladeball",
@@ -520,7 +588,7 @@ if Lib and Lib.CreateWindow then
     local VisTab = Window:Tab("Visuals & Debug", "eye")
 
     local ParrySection = Main:Section("Parry Core", "Left", "Automatic deflection via direction scanning")
-    local SettingsSection = Main:Section("Settings", "Right", "Parry behavior & abilities")
+    local ClashSection = Main:Section("Clash Mode", "Right", "High-speed close proximity block spam")
 
     ParrySection:Toggle("Auto Parry", Config.AutoParry, function(v)
         Config.AutoParry = v
@@ -539,7 +607,20 @@ if Lib and Lib.CreateWindow then
         Config.MinAuraRadius = v
     end)
 
-    SettingsSection:Toggle("Auto Ability", Config.AutoAbility, function(v)
+    ClashSection:Toggle("Auto Clash Mode", Config.AutoClash, function(v)
+        Config.AutoClash = v
+        print("[AutoParry] Auto Clash Mode set to: " .. tostring(v))
+    end)
+
+    ClashSection:Slider("Clash Distance", 10, 40, Config.ClashDistance, function(v)
+        Config.ClashDistance = v
+    end)
+
+    ClashSection:Slider("Clash Min Speed", 10, 100, Config.ClashMinSpeed, function(v)
+        Config.ClashMinSpeed = v
+    end)
+
+    ClashSection:Toggle("Auto Ability", Config.AutoAbility, function(v)
         Config.AutoAbility = v
     end)
 
@@ -564,4 +645,4 @@ if Lib and Lib.CreateWindow then
     end)
 end
 
-print("=== Blade Ball Auto Parry (AntiCheat Teleport Filter + Physical Speed Cap) Loaded ===")
+print("=== Blade Ball Auto Parry (Auto Clash Mode + Spam Engine Included) Loaded ===")
