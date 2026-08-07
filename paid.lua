@@ -97,21 +97,18 @@ local Config = {
     AutoParryKey = "X", -- Default keybind to toggle Auto Parry (e.g. "X")
     ParryMode = "F Key", -- "F Key", "LMB (Mouse)", "Both (F + LMB)", "All (Key + Mouse)"
     TargetCheck = true,  -- Strict target check (prevents false positives when ball flies near you to another player)
-    MinAuraRadius = 15,  -- Base aura circle radius (studs)
-    ParryLeadTime = 0.25,-- Lead time added to network ping for TTI calculation (seconds)
-    AutoClash = true,    -- Automatic Clash Mode (Block spam when close)
+    ParryLeadTime = 0.18,-- Optimal lead time for Roblox parry block window (seconds)
+    AutoClash = false,    -- Automatic Clash Mode (Block spam when close)
     ClashDistance = 22,  -- Distance threshold for Clash Mode (studs)
     ClashMinSpeed = 35,  -- Min ball speed for Clash Mode (studs/s)
     AutoAbility = false,
     DebugConsole = true, -- Logs target threat & parry triggers to F9 developer console
-    RangeRing = true,    -- Draws 3D floor ring for parry distance
     Trajectory = true,   -- Draws ball flight trajectory line
     KeybindHUD = true,   -- Floating Keybinds Island HUD
     UseRemote = false,   -- Disabled by default to avoid Matcha "hybrid mode" errors
 }
 
 local State = {
-    auraRadius = 15,
     lastParryTime = 0,
     parryCount = 0,
     lastThreatState = nil,
@@ -121,6 +118,12 @@ local State = {
     rawVel = Vector3.new(),
     inClash = false,
     lastClashSpam = 0,
+    -- Curve trajectory tracking
+    trajSamples = {},
+    isCurving = false,
+    curveAngle = 0,
+    lastLogState = "",
+    lastLogTime = 0,
 }
 
 --------------------------------------------------------------------------------
@@ -167,7 +170,7 @@ end
 --------------------------------------------------------------------------------
 -- Anti-Cheat Ball Resolver (Physical Speed Cap & Outlier Filter)
 --------------------------------------------------------------------------------
-local MAX_PHYSICAL_SPEED = 550 -- Max realistic ball speed (studs/s). Anything above is anti-cheat teleport jump.
+local MAX_PHYSICAL_SPEED = 2500 -- Max physical ball speed cap for extreme Death Ball velocities
 
 local Resolver = {
     rawPos = Vector3.new(),
@@ -190,6 +193,9 @@ function Resolver:Reset()
     State.prevRawPos = Vector3.new()
     State.rawVel = Vector3.new()
     State.inClash = false
+    State.trajSamples = {}
+    State.isCurving = false
+    State.curveAngle = 0
 end
 
 function Resolver:Update(part, dt)
@@ -205,7 +211,7 @@ function Resolver:Update(part, dt)
     dt = math.clamp(dt, 0.001, 0.1)
 
     -- Detect sudden ball teleport / round start reset
-    if self.resolvedPos ~= Vector3.new() and (raw - self.resolvedPos).Magnitude > 180 then
+    if self.resolvedPos ~= Vector3.new() and (raw - self.resolvedPos).Magnitude > 250 then
         self:Reset()
         self.resolvedPos = raw
         self.lastValidTime = now
@@ -235,7 +241,7 @@ function Resolver:Update(part, dt)
         return true
     end
 
-    -- Reject Anti-Cheat Teleport Jumps (Extreme Speeds > 550 studs/s)
+    -- Reject extreme teleport spikes (> MAX_PHYSICAL_SPEED)
     if instantSpeed > MAX_PHYSICAL_SPEED then
         self.outlierCount = self.outlierCount + 1
         self.resolvedPos = self.resolvedPos + self.resolvedVel * dt
@@ -247,18 +253,48 @@ function Resolver:Update(part, dt)
     if State.rawVel.Magnitude > 10 and self.resolvedVel.Magnitude > 10 then
         local dirDot = State.rawVel.Unit:Dot(self.resolvedVel.Unit)
         if dirDot < 0.4 then
-            -- Sudden turnaround hit! Snap immediately!
+            -- Sudden turnaround hit! Snap immediately & clear curve history
             self.resolvedPos = raw
             self.resolvedVel = State.rawVel
             self.spd = State.rawVel.Magnitude
             self.lastValidTime = now
+            State.trajSamples = {}
+            State.isCurving = false
+            State.curveAngle = 0
             return true
         end
     end
 
-    -- Normal physical movement: update position & velocity with fast lerp
-    self.resolvedPos = self.resolvedPos:Lerp(raw, 0.80)
-    self.resolvedVel = self.resolvedVel:Lerp(State.rawVel, 0.75)
+    -- Trajectory sampling for curve ball / arc detection
+    table.insert(State.trajSamples, { pos = raw, vel = State.rawVel, time = now })
+    if #State.trajSamples > 15 then
+        table.remove(State.trajSamples, 1)
+    end
+
+    -- Calculate curve angle over trajectory window
+    if #State.trajSamples >= 4 then
+        local totalAngle = 0
+        for i = 2, #State.trajSamples do
+            local prevV = State.trajSamples[i - 1].vel
+            local currV = State.trajSamples[i].vel
+            if prevV.Magnitude > 5 and currV.Magnitude > 5 then
+                local dotVal = math.clamp(prevV.Unit:Dot(currV.Unit), -1, 1)
+                local angDeg = math.deg(math.acos(dotVal))
+                if angDeg > 3 then
+                    totalAngle = totalAngle + angDeg
+                end
+            end
+        end
+        State.curveAngle = totalAngle
+        State.isCurving = totalAngle > 8.0
+    else
+        State.isCurving = false
+        State.curveAngle = 0
+    end
+
+    -- Normal physical movement update with fast lerp
+    self.resolvedPos = self.resolvedPos:Lerp(raw, 0.85)
+    self.resolvedVel = self.resolvedVel:Lerp(State.rawVel, 0.80)
     self.spd = self.resolvedVel.Magnitude
     self.lastValidTime = now
     self.validCount = self.validCount + 1
@@ -296,9 +332,13 @@ local function isBallTargetingMe(ball)
     if not ball or not lp then return false end
 
     -- Check attributes (string or instance)
-    local targetAttr = ball:GetAttribute("target") or ball:GetAttribute("Target") or ball:GetAttribute("targeter") or ball:GetAttribute("Targeter")
+    local targetAttr = ball:GetAttribute("target") or ball:GetAttribute("Target") 
+        or ball:GetAttribute("targeter") or ball:GetAttribute("Targeter")
+        or ball:GetAttribute("TargetPlayer") or ball:GetAttribute("ClientTarget")
+        or ball:GetAttribute("player") or ball:GetAttribute("Player")
+        or ball:GetAttribute("TargetValue") or ball:GetAttribute("ballTarget") or ball:GetAttribute("BallTarget")
     if targetAttr ~= nil then
-        if type(targetAttr) == "string" and targetAttr == lp.Name then
+        if type(targetAttr) == "string" and (targetAttr == lp.Name or string.lower(targetAttr) == string.lower(lp.Name)) then
             return true
         elseif typeof(targetAttr) == "Instance" and (targetAttr == lp or targetAttr == lp.Character) then
             return true
@@ -307,12 +347,16 @@ local function isBallTargetingMe(ball)
         end
     end
 
-    -- Check children objects (StringValue or ObjectValue)
-    local targetVal = ball:FindFirstChild("target") or ball:FindFirstChild("Target") or ball:FindFirstChild("targeter")
+    -- Check children objects (StringValue, ObjectValue)
+    local targetVal = ball:FindFirstChild("target") or ball:FindFirstChild("Target") 
+        or ball:FindFirstChild("targeter") or ball:FindFirstChild("Targeter")
+        or ball:FindFirstChild("TargetPlayer") or ball:FindFirstChild("ClientTarget")
+        or ball:FindFirstChild("player") or ball:FindFirstChild("Player")
+        or ball:FindFirstChild("TargetValue") or ball:FindFirstChild("ballTarget") or ball:FindFirstChild("BallTarget")
     if targetVal then
         if targetVal:IsA("ObjectValue") and (targetVal.Value == lp or targetVal.Value == lp.Character) then
             return true
-        elseif targetVal:IsA("StringValue") and targetVal.Value == lp.Name then
+        elseif targetVal:IsA("StringValue") and (targetVal.Value == lp.Name or string.lower(targetVal.Value) == string.lower(lp.Name)) then
             return true
         else
             return false
@@ -338,8 +382,8 @@ local function scanBallDirection(ball)
 
     local distToPlayer = (hrp.Position - ballPos).Magnitude
 
-    if ballSpeed < 2 or ballSpeed > MAX_PHYSICAL_SPEED then
-        return false, 0, distToPlayer, 999, 999, "Invalid Speed"
+    if ballSpeed < 1 or ballSpeed > MAX_PHYSICAL_SPEED then
+        return false, 0, distToPlayer, 999, 999, "Invalid Speed (" .. tostring(math.floor(ballSpeed)) .. ")"
     end
 
     local dirToPlayer = (hrp.Position - ballPos).Unit
@@ -349,7 +393,7 @@ local function scanBallDirection(ball)
     local perpDist = distToPlayer * math.sqrt(math.max(0, 1 - dotProd^2))
     local tti = distToPlayer / math.max(ballSpeed, 0.1)
 
-    -- 1. Check game target attributes (Primary Anti-False Positive mechanism)
+    -- 1. Check game target attributes (Primary Anti-False Positive mechanism for crowds)
     local targetingMe = isBallTargetingMe(ball)
     if Config.TargetCheck and targetingMe == false then
         return false, dotProd, distToPlayer, tti, perpDist, "Targeting Other Player"
@@ -360,8 +404,8 @@ local function scanBallDirection(ball)
     end
 
     -- 2. Fallback Physics Check if target attribute is absent/unknown:
-    -- Require strong directional alignment (dotProd > 0.75) and trajectory miss distance < 12 studs
-    local isThreat = (dotProd > 0.75 and perpDist < 12.0)
+    -- Require direct vector alignment (dotProd > 0.92), close trajectory (perpDist < 7.0 studs), and within 80 studs
+    local isThreat = (dotProd > 0.92 and perpDist < 7.0 and distToPlayer <= 80.0)
     return isThreat, dotProd, distToPlayer, tti, perpDist, isThreat and "Physics Threat" or "Safe Vector"
 end
 
@@ -505,7 +549,7 @@ RunService.Heartbeat:Connect(function()
         Resolver:Reset()
         if Config.DebugConsole and State.lastThreatState ~= nil and State.lastThreatState ~= false then
             State.lastThreatState = false
-            print("[AutoParry] ⚪ Ball not found / inactive")
+            print("[AutoParry] ⚪ Ball inactive / round ended")
         end
         return
     end
@@ -517,81 +561,84 @@ RunService.Heartbeat:Connect(function()
     local hrp = chr and (chr:FindFirstChild("HumanoidRootPart") or chr.PrimaryPart)
 
     ----------------------------------------------------------------------------
-    -- CLASH MODE DETECTION & BLOCK SPAMMING ENGINE
+    -- MANUAL AUTOCLICKER CLASH MODE
     ----------------------------------------------------------------------------
-    local isClashActive = false
-    if Config.AutoParry and Config.AutoClash and hrp then
-        local clashDistLimit = Config.ClashDistance or 22
-        local clashMinSpd = Config.ClashMinSpeed or 35
-        local hasEnemyNear = isEnemyNear(hrp, clashDistLimit + 10)
-
-        -- Clash Condition (MUST be a real threat to LocalPlayer!):
-        -- 1. Ball is targeting / threatening LocalPlayer
-        -- 2. Ball is within Clash Distance (<= 22 studs)
-        -- 3. Ball speed >= ClashMinSpeed OR enemy is close by
-        if isThreat and distToPlayer <= clashDistLimit and (Resolver.spd >= clashMinSpd or hasEnemyNear) then
-            isClashActive = true
-        end
-    end
-
-    if isClashActive then
+    if Config.AutoClash then
         if not State.inClash then
             State.inClash = true
             if Config.DebugConsole then
-                print(string.format("[AutoParry] ⚔️ CLASH MODE ACTIVATED! (Dist: %.1f studs | Speed: %.1f studs/s) - SPAMMING BLOCK!", distToPlayer, Resolver.spd))
+                print("[AutoParry:CLASH] ⚔️ Auto Clash Autoclicker ACTIVATED (Block Spamming ON)")
             end
         end
 
-        -- Ultra-fast Clash Spamming (~40 Hz block spam)
-        if now - State.lastClashSpam > 0.025 then
+        -- Continuous High-Speed Block Autoclicker (~35-40 Hz)
+        if now - State.lastClashSpam > 0.026 then
             State.lastClashSpam = now
             State.lastParryTime = now
             State.parryCount = State.parryCount + 1
             doParry()
         end
-        return -- Skip normal single-parry logic while in Clash Mode
+        return -- Bypass standard parry logic while AutoClash autoclicker is active
     else
         if State.inClash then
             State.inClash = false
             if Config.DebugConsole then
-                print("[AutoParry] 🛡️ Clash Mode Deactivated")
+                print("[AutoParry:CLASH] 🛡️ Auto Clash Autoclicker DEACTIVATED")
             end
         end
     end
 
     ----------------------------------------------------------------------------
-    -- STANDARD SINGLE-PARRY DIRECTIONAL LOGIC
+    -- ACCURATE TIME-TO-IMPACT (TTI) PARRY CALCULATION
     ----------------------------------------------------------------------------
     local pingSeconds = State.ping / 1000
-    local parryLead = Config.ParryLeadTime or 0.25
-    local targetTTIThreshold = math.clamp(pingSeconds + parryLead, 0.10, 0.50)
+    local parryLead = Config.ParryLeadTime or 0.18
+    local baseTTIThreshold = pingSeconds + parryLead
 
-    -- Dynamic Visual Aura Radius
-    local baseAuraRadius = Config.MinAuraRadius or 15
-    local speedAddition = Resolver.spd * (pingSeconds + 0.15)
-    State.auraRadius = math.clamp(baseAuraRadius + speedAddition, baseAuraRadius, 50)
+    -- Curve multiplier: if ball is curving, add small lead time (+0.02s) for arc trajectory
+    local curveMult = State.isCurving and 1.15 or 1.0
+    local targetTTIThreshold = math.clamp(baseTTIThreshold * curveMult, 0.14, 0.38)
 
+    -- Dynamic max parry distance scaling with ball speed:
+    -- Cap at 50.0 studs for low speeds (preventing early air parries)
+    -- Scale up to 180.0 studs for medium/high-speed balls (> 250 studs/s)
+    local maxDistCap = Resolver.spd > 250 and 180.0 or 50.0
+    local maxParryDist = math.clamp(Resolver.spd * targetTTIThreshold + 4.0, 15.0, maxDistCap)
+
+    ----------------------------------------------------------------------------
+    -- DETAILED F9 DIAGNOSTIC LOGGING
+    ----------------------------------------------------------------------------
     if Config.DebugConsole then
-        if isThreat ~= State.lastThreatState then
+        if isThreat ~= State.lastThreatState or (isThreat and now - State.lastLogTime > 0.4) then
             State.lastThreatState = isThreat
+            State.lastLogTime = now
             if isThreat then
-                print(string.format("[AutoParry] 🎯 THREAT DETECTED (%s)! Speed: %.1f studs/s | Dist: %.1f studs | TTI: %.2fs | Dot: %.2f", threatReason, Resolver.spd, distToPlayer, tti, dotProd))
+                print(string.format("[AutoParry:TARGET] 🎯 Threat: %s | Spd: %.1f studs/s | Dist: %.1f (MaxDist: %.1f) | TTI: %.3fs (Thresh: %.3fs) | Curve: %s (%.1f deg) | Ping: %dms",
+                    threatReason, Resolver.spd, distToPlayer, maxParryDist, tti, targetTTIThreshold, State.isCurving and "YES" or "NO", State.curveAngle, State.ping))
             else
-                print(string.format("[AutoParry] 🟢 Vector safe / turned away (%s) | Speed: %.1f studs/s | Dist: %.1f studs | Dot: %.2f", threatReason, Resolver.spd, distToPlayer, dotProd))
+                print(string.format("[AutoParry:REJECT] 🟢 Rejected: %s | Spd: %.1f studs/s | Dist: %.1f studs | Dot: %.2f | Ping: %dms",
+                    threatReason, Resolver.spd, distToPlayer, dotProd, State.ping))
             end
         end
     end
 
+    ----------------------------------------------------------------------------
+    -- PARRY TRIGGERING DECISION (Strict TTI + Proximity Window)
+    ----------------------------------------------------------------------------
     local timeSinceLastParry = now - State.lastParryTime
-    local triggerCondition = (tti <= targetTTIThreshold) or (distToPlayer <= Config.MinAuraRadius)
-    local shouldParry = Config.AutoParry and isThreat and triggerCondition and (timeSinceLastParry > 0.18)
+    local minCooldown = (tti <= 0.12 and distToPlayer <= 35) and 0.05 or 0.12
+
+    -- Trigger ONLY when ball is within TTI threshold AND within physical block range (<= maxParryDist)
+    local triggerCondition = (tti <= targetTTIThreshold) and (distToPlayer <= maxParryDist)
+    local shouldParry = Config.AutoParry and isThreat and triggerCondition and (timeSinceLastParry > minCooldown)
 
     if shouldParry then
         State.lastParryTime = now
         State.parryCount = State.parryCount + 1
 
         if Config.DebugConsole then
-            print(string.format("[AutoParry] ⚡ PARRY EXECUTED (#%d)! Mode: %s | Dist: %.1f studs | Speed: %.1f studs/s | TTI: %.2fs (Thresh: %.2fs)", State.parryCount, Config.ParryMode, distToPlayer, Resolver.spd, tti, targetTTIThreshold))
+            print(string.format("[AutoParry:TRIGGER] ⚡ EXECUTED (#%d)! Mode: %s | Dist: %.1f studs | Spd: %.1f studs/s | TTI: %.3fs | Target: %s | Curve: %s | Ping: %dms",
+                State.parryCount, Config.ParryMode, distToPlayer, Resolver.spd, tti, threatReason, State.isCurving and "YES" or "NO", State.ping))
         end
 
         doParry()
@@ -621,84 +668,25 @@ UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end)
 
 --------------------------------------------------------------------------------
--- 3D Rendering (Drawing API: Dynamic Aura Ring & Trajectory Line)
+-- 3D Rendering (Drawing API: Trajectory Line & Keybind HUD)
 --------------------------------------------------------------------------------
 task.spawn(function()
     local have_draw = type(Drawing) == "table"
     if not have_draw then return end
 
-    local SEGMENTS = 24
-    local circleOffsets = {}
-    for i = 1, SEGMENTS do
-        local angle = (i - 1) / SEGMENTS * math.pi * 2
-        circleOffsets[i] = { cos = math.cos(angle), sin = math.sin(angle) }
-    end
-
-    local ringLines = {}
-    for i = 1, SEGMENTS do
-        local l = Drawing.new("Line")
-        if l then l.Visible = false; l.Thickness = 2; l.Transparency = 1 end
-        ringLines[i] = l
-    end
-
     local dotObj = {}
     local hudBg, hudLine, hudHeader, hudItem
 
     while true do
-        task.wait(0.016) -- ~60 FPS update rate for 3D Ring
+        task.wait(0.016) -- ~60 FPS update rate
         pcall(function()
-            -- Render Aura Circle (3D Ring)
-            if Config.RangeRing then
-                local chr = getLocalCharacter()
-                local hrp = chr and (chr:FindFirstChild("HumanoidRootPart") or chr.PrimaryPart)
-                if hrp then
-                    local currentAuraRadius = State.inClash and (Config.ClashDistance or 22) or (State.auraRadius or 15)
-                    local ppos = hrp.Position
-                    local py = ppos.Y - 3
-                    local screenPoints = {}
-
-                    for i = 1, SEGMENTS do
-                        local off = circleOffsets[i]
-                        local p = Vector3.new(ppos.X + off.cos * currentAuraRadius, py, ppos.Z + off.sin * currentAuraRadius)
-                        local sv, on = CustomW2S(p)
-                        screenPoints[i] = { pos = sv, visible = on }
-                    end
-
-                    -- Change ring color to Bright Red in Clash Mode, White in Normal Mode
-                    local ringColor = State.inClash and Color3.fromRGB(255, 50, 50) or Color3.fromRGB(255, 255, 255)
-                    local ringThickness = State.inClash and 3 or 2
-
-                    for i = 1, SEGMENTS do
-                        local nxt = (i % SEGMENTS) + 1
-                        local p1 = screenPoints[i]
-                        local p2 = screenPoints[nxt]
-                        local line = ringLines[i]
-
-                        if line and p1.visible and p2.visible then
-                            line.From = p1.pos
-                            line.To = p2.pos
-                            line.Color = ringColor
-                            line.Thickness = ringThickness
-                            line.Transparency = 1
-                            line.Visible = true
-                        elseif line then
-                            line.Visible = false
-                        end
-                    end
-                else
-                    for i = 1, SEGMENTS do if ringLines[i] then ringLines[i].Visible = false end end
-                end
-            else
-                for i = 1, SEGMENTS do if ringLines[i] then ringLines[i].Visible = false end end
-            end
-
             -- Render Resolved Trajectory Line
             for _, l in pairs(dotObj) do if l then l.Visible = false end end
             if Config.Trajectory and Resolver.spd > 1 and Resolver.spd <= MAX_PHYSICAL_SPEED and Resolver.resolvedPos ~= Vector3.new() then
                 local prev
                 local velDir = Resolver.resolvedVel.Unit
-                for i = 0, 5 do
-                    local p = Resolver.resolvedPos + velDir * Resolver.spd * (i * 0.35)
+                for i = 0, 6 do
+                    local p = Resolver.resolvedPos + velDir * Resolver.spd * (i * 0.30)
                     local sv, on = CustomW2S(p)
                     if on then
                         if prev then
@@ -707,7 +695,8 @@ task.spawn(function()
                                 dotObj[i].Visible = true
                                 dotObj[i].From = prev
                                 dotObj[i].To = sv
-                                dotObj[i].Color = State.inClash and Color3.fromRGB(255, 50, 50) or Color3.fromRGB(255, 255, 0)
+                                dotObj[i].Color = State.inClash and Color3.fromRGB(255, 50, 50) 
+                                    or (State.isCurving and Color3.fromRGB(255, 170, 0) or Color3.fromRGB(0, 230, 255))
                                 dotObj[i].Thickness = 3
                                 dotObj[i].Transparency = 1
                             end
@@ -716,6 +705,7 @@ task.spawn(function()
                     end
                 end
             end
+
             -- Render Keybind HUD Island (Fallback when Lib is not loaded)
             if Config.KeybindHUD and not Lib then
                 if not hudBg then
@@ -773,8 +763,8 @@ end)
 --------------------------------------------------------------------------------
 if Lib and Lib.CreateWindow then
     local Window = Lib:CreateWindow({
-        title = "Blade Ball - AntiCheat Resolver",
-        subtitle = "Matcha AP",
+        title = "Death Ball / Blade Ball - Matcha",
+        subtitle = "Auto Parry & Clash Engine",
         size = Vector2.new(620, 480),
         menuKey = "p",
         configName = "bladeball_resolver",
@@ -799,7 +789,7 @@ if Lib and Lib.CreateWindow then
         Window:AddSettingsTab()
     end
 
-    local ParrySection = Main:Section("Parry Core", "Left", "Automatic deflection via direction scanning")
+    local ParrySection = Main:Section("Parry Core", "Left", "Automatic deflection via target & curve scanning")
     local ClashSection = Main:Section("Clash Mode", "Right", "High-speed close proximity block spam")
 
     ParrySection:Toggle("Auto Parry", Config.AutoParry, function(v)
@@ -820,11 +810,7 @@ if Lib and Lib.CreateWindow then
         Config.ParryMode = v
     end)
 
-    ParrySection:Slider("Min Aura Radius", 10, 40, Config.MinAuraRadius, function(v)
-        Config.MinAuraRadius = v
-    end)
-
-    ParrySection:Slider("Parry Lead Time (x100s)", 10, 50, math.floor(Config.ParryLeadTime * 100), function(v)
+    ParrySection:Slider("Parry Lead Time (x100s)", 10, 35, math.floor(Config.ParryLeadTime * 100), function(v)
         Config.ParryLeadTime = v / 100
     end)
 
@@ -845,12 +831,8 @@ if Lib and Lib.CreateWindow then
         Config.AutoAbility = v
     end):AddKeybind("V", "Toggle")
 
-    local RenderSection = VisTab:Section("Render Settings", "Left", "3D distance ring & trajectory line")
+    local RenderSection = VisTab:Section("Render Settings", "Left", "Trajectory line display settings")
     local DebugSection = VisTab:Section("Console Logging", "Right", "Developer console logs (F9)")
-
-    RenderSection:Toggle("White Aura Circle (3D Ring)", Config.RangeRing, function(v)
-        Config.RangeRing = v
-    end)
 
     RenderSection:Toggle("Ball Flight Trajectory", Config.Trajectory, function(v)
         Config.Trajectory = v
@@ -875,4 +857,4 @@ else
     warn("[AutoParry] Could not initialize UI Library (Lib is nil). UI Menu skipped.")
 end
 
-print("=== Blade Ball Auto Parry (Target Verification + Anti-False Positive Engine) Loaded ===")
+print("=== Death Ball / Blade Ball Auto Parry (Target Verification + Curve Engine) Loaded ===")
